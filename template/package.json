@@ -1,0 +1,13 @@
+{
+  "name": "core-template",
+  "version": "1.0.0",
+  "description": "Minimal zero-dependency Node.js HTTP app template",
+  "main": "core.js",
+  "private": true,
+  "scripts": {
+    "start": "node core.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

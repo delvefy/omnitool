@@ -1,0 +1,126 @@
+===============================================================================
+ core.js — Node.js HTTP App Template
+===============================================================================
+
+A minimal, zero-dependency HTTP application built only on Node's built-in
+`http` module. State is persisted to db.json, which acts as the database.
+
+-------------------------------------------------------------------------------
+ FILES
+-------------------------------------------------------------------------------
+  core.js    The whole application, split into 3 sections (see below).
+  db.json    The data store. Read on every request, written on every change.
+  docs.txt   This file.
+
+-------------------------------------------------------------------------------
+ RUNNING
+-------------------------------------------------------------------------------
+  node core.js
+
+  Listens on http://localhost:3000 by default. Override the port with:
+
+      PORT=8080 node core.js
+
+-------------------------------------------------------------------------------
+ HOW core.js IS STRUCTURED (3 sections)
+-------------------------------------------------------------------------------
+
+  1. ENDPOINTS
+     The route table. Each entry is keyed by "METHOD /path" and points to a
+     handler name plus the list of params it expects:
+
+         'GET /items/:id': { fn: 'getItem', params: ['id'] }
+
+     A segment beginning with ":" (e.g. :id) is a route parameter.
+
+  2. PARAMS
+     Declares every accepted param and how to read it:
+         source   - 'route' | 'query' | 'body'
+         type     - 'string' | 'number' | 'boolean' | 'any' (coercion)
+         required - true => a missing value returns HTTP 400
+         default  - used when an optional param is absent
+
+     The runtime turns these declarations into the `args` object passed to
+     each handler, so handlers never parse the request themselves.
+
+  3. FUNCTIONS
+     The request handlers (business logic) and the supporting runtime:
+     database helpers (loadDb/saveDb), param resolution, route matching, and
+     the HTTP server. Each handler has the signature:
+
+         (args, db) => { status, body }
+
+     Mutate `db` and call saveDb(db) to persist changes.
+
+-------------------------------------------------------------------------------
+ ENDPOINTS (default example: a CRUD "items" resource)
+-------------------------------------------------------------------------------
+
+  GET    /                List the API name and available endpoints.
+
+  GET    /items           List all items.
+                          Optional query param ?q=text filters by name.
+                          -> 200 [ {item}, ... ]
+
+  GET    /items/:id       Fetch one item by id.
+                          -> 200 {item}  |  404 { error }
+
+  POST   /items           Create an item. JSON body: { name, value? }
+                          -> 201 {item}  |  400 { error } if name missing
+
+  PUT    /items/:id       Replace an item's fields. JSON body: { name, value? }
+                          -> 200 {item}  |  404 { error }
+
+  DELETE /items/:id       Delete an item.
+                          -> 200 {deleted item}  |  404 { error }
+
+  All responses are JSON. Errors use { "error": "message" }.
+
+-------------------------------------------------------------------------------
+ EXAMPLES (curl)
+-------------------------------------------------------------------------------
+
+  # List items
+  curl http://localhost:3000/items
+
+  # Search by name
+  curl "http://localhost:3000/items?q=first"
+
+  # Get one
+  curl http://localhost:3000/items/1
+
+  # Create
+  curl -X POST http://localhost:3000/items \
+       -H "Content-Type: application/json" \
+       -d '{"name":"Third item","value":300}'
+
+  # Update
+  curl -X PUT http://localhost:3000/items/1 \
+       -H "Content-Type: application/json" \
+       -d '{"name":"Renamed","value":150}'
+
+  # Delete
+  curl -X DELETE http://localhost:3000/items/1
+
+-------------------------------------------------------------------------------
+ ADDING A NEW ENDPOINT
+-------------------------------------------------------------------------------
+  1. ENDPOINTS: add a row, e.g.
+         'GET /items/:id/value': { fn: 'getValue', params: ['id'] }
+
+  2. PARAMS: declare any new param names you referenced (existing ones can be
+     reused). Example:
+         tag: { source: 'query', type: 'string', required: false, default: '' }
+
+  3. FUNCTIONS: write the handler and register it in the `handlers` map:
+         function getValue(args, db) { ... return { status, body }; }
+         const handlers = { ..., getValue };
+
+-------------------------------------------------------------------------------
+ NOTES & LIMITATIONS
+-------------------------------------------------------------------------------
+  - No external dependencies; runs on a stock Node.js install.
+  - db.json is read fully on each request and rewritten on each change. This is
+    fine for a template/prototype, not for high concurrency or large datasets.
+  - Request bodies must be valid JSON; bodies over ~1 MB are rejected (413).
+===============================================================================

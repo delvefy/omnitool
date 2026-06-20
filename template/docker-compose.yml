@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    image: core-template
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+    restart: unless-stopped
+    # Storage is ephemeral by design. For real persistence, the cleaner path is to make
+    # the DB location configurable in core.js (e.g. DB_PATH env) and mount a volume there,
+    # rather than mounting over the whole /app directory.
