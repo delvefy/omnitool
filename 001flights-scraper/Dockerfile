@@ -12,8 +12,9 @@ COPY --chown=node:node package.json ./
 COPY --chown=node:node core.js db.json docs.txt search.html ./
 
 ENV PORT=3000
-# Live flight search needs a Kiwi.com Tequila API key. Provide it at run time:
-#   docker run -e TEQUILA_API_KEY=xxxx ...   (alias: FLIGHT_API_KEY)
+# Live flight search needs a SerpApi key (https://serpapi.com). auth.json is
+# .dockerignore'd (never baked into the image), so pass the key at run time:
+#   docker run -e SERPAPI_API_KEY=xxxx ...
 # The server still boots without it; /search shows a "configure key" banner.
 EXPOSE 3000
 

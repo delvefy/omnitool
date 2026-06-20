@@ -2,26 +2,34 @@
  * core.js — Flight Finder (built on the zero-dependency Node.js HTTP template).
  *
  * A Google-Flights-style search service. It serves an interactive page at
- * GET /search and exposes a small JSON API backed by a LIVE flight provider
- * (Kiwi.com Tequila API). It supports:
+ * GET /search and exposes a small JSON API backed by a LIVE flight provider:
+ * SerpApi's Google Flights engine (https://serpapi.com/google-flights-api).
  *
+ * Supports:
  *   - city -> city, city -> country, country -> city, country -> country search
- *   - single day OR a date interval (earliest/latest departure)
+ *   - single day OR a date interval (earliest..latest departure)
  *   - round trips (outbound + return date intervals)
  *   - multi-city itineraries (e.g. Stockholm-Athens-Bucharest-Stockholm),
  *     each leg with its own date interval
  *
+ * Design notes (because of how SerpApi/Google Flights works):
+ *   - Google Flights takes ONE date per search, not a range. So a date interval
+ *     is fanned out into one search per day (bounded — see the caps below — to
+ *     protect your SerpApi quota).
+ *   - SerpApi has no place-autocomplete endpoint, so a compact airport/city/
+ *     country table is embedded here purely to (a) power /api/locations and
+ *     (b) turn a typed city/country into the airport codes Google Flights wants
+ *     (it accepts comma-separated IATA codes). All PRICES/TIMES are 100% live.
+ *   - Round-trip & multi-city are modelled as independent one-way searches per
+ *     leg, then combined. This keeps API usage bounded and returns full flight
+ *     detail for every leg. Trade-off: a round-trip total is the sum of two
+ *     one-way fares (airlines sometimes price true round trips lower).
+ *
  * The file keeps the template's 3-section layout:
- *   1. ENDPOINTS  — the route table (URL -> handler + params).
- *   2. PARAMS     — declares every accepted input and how to read it.
- *   3. FUNCTIONS  — handlers, the flight provider + engine, and the runtime.
+ *   1. ENDPOINTS  2. PARAMS  3. FUNCTIONS
  *
- * db.json is still the template's tiny data store (the demo "items" resource).
- * Flight data is fetched live and is NOT persisted.
- *
- * Run with:
- *     TEQUILA_API_KEY=xxxxx node core.js        (alias: FLIGHT_API_KEY)
- *
+ * Run with (key can also live in auth.json — see below):
+ *     SERPAPI_API_KEY=xxxxx node core.js
  * Then open http://localhost:3000/search
  */
 
@@ -34,15 +42,12 @@ const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const DB_PATH = path.join(__dirname, 'db.json');
+const AUTH_PATH = path.join(__dirname, 'auth.json');
 const SEARCH_HTML_PATH = path.join(__dirname, 'search.html');
 
 
 /* ============================================================================
  * SECTION 1: ENDPOINTS
- * ----------------------------------------------------------------------------
- * Each key is "METHOD /path"; each value names a handler (FUNCTIONS section)
- * and the params (PARAMS section) it expects. A ":seg" path segment is a route
- * parameter.
  * ==========================================================================*/
 const endpoints = {
   'GET    /':              { fn: 'home',          params: [] },
@@ -64,10 +69,6 @@ const endpoints = {
 
 /* ============================================================================
  * SECTION 2: PARAMS
- * ----------------------------------------------------------------------------
- * For each param: source ('route'|'query'|'body'), type ('string'|'number'|
- * 'boolean'|'any'), required, and default. resolveParams() turns these into the
- * `args` object handed to each handler.
  * ==========================================================================*/
 const params = {
   // routing / template
@@ -114,54 +115,205 @@ function saveDb(db) {
 
 
 /* ============================================================================
- * FLIGHT PROVIDER + ENGINE
+ * FLIGHT PROVIDER (SerpApi / Google Flights) + ENGINE
  * ----------------------------------------------------------------------------
- * Live data comes from the Kiwi.com Tequila API (https://tequila.kiwi.com).
- * Configure with environment variables before starting the server:
+ * API key resolution order:
+ *   1. SERPAPI_API_KEY (or SERPAPI_KEY) environment variable
+ *   2. auth.json  ->  { "serpapi": { "api_key": "..." } }   (git-ignored)
  *
- *     TEQUILA_API_KEY   the API key (alias: FLIGHT_API_KEY)   [required]
- *     TEQUILA_HOST      override host (default api.tequila.kiwi.com)
- *
- * Provider endpoints used:
- *     GET  /locations/query   autocomplete (airports, cities, countries)
- *     GET  /v2/search         one-way & round-trip search (with date ranges)
- *     POST /v2/flights_multi  multi-city search (each leg with a date range)
- *
- * Everything below normalizes those payloads into ONE slice-based itinerary
- * shape, so the /search page renders one-way, round-trip and multi-city
- * results with identical code. A "slice" is one directed journey (one leg of a
- * multi-city trip, or the outbound/return half of a round trip) and contains
- * one or more flight "segments".
+ * Quota guards (env-overridable):
+ *   SERPAPI_MAX_RANGE_DAYS  max days searched per leg date interval  (def 3)
+ *   SERPAPI_MAX_CALLS       hard cap on API calls per search         (def 12)
+ *   SERPAPI_CONCURRENCY     parallel API calls                       (def 4)
+ *   SERPAPI_GL / SERPAPI_HL Google country/language                  (def us/en)
+ *   SERPAPI_HOST            override host (def serpapi.com)
  * ==========================================================================*/
 
-function apiKey() {
-  return process.env.TEQUILA_API_KEY || process.env.FLIGHT_API_KEY || '';
-}
-
-// "best" ranking is a generalized cost: money + a price-per-hour for travel
-// time + a penalty per stopover. Tunable without touching the sort logic.
-const TIME_VALUE_PER_HOUR = 35;
-const STOP_PENALTY = 50;
-
-const CABIN_CODES = { economy: 'M', premium: 'W', business: 'C', first: 'F' };
-const SORT_CODES  = { cheapest: 'price', fastest: 'duration', best: 'quality' };
-const TEQUILA_TYPES = new Set(['airport', 'city', 'country', 'subdivision']);
-
-function clampInt(v, lo, hi, dflt) {
-  const n = Math.round(Number(v));
+function envInt(name, dflt, lo, hi) {
+  const n = parseInt(process.env[name], 10);
   if (!Number.isFinite(n)) return dflt;
   return Math.max(lo, Math.min(hi, n));
 }
 
-// "YYYY-MM-DD" -> "DD/MM/YYYY" (the format Tequila expects). Throws 400 on bad input.
-function toDMY(d) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(d || '').trim());
-  if (!m) throw { status: 400, body: { error: `Invalid date "${d}", expected YYYY-MM-DD` } };
-  return `${m[3]}/${m[2]}/${m[1]}`;
+const MAX_RANGE_DAYS = envInt('SERPAPI_MAX_RANGE_DAYS', 3, 1, 31);
+const MAX_TOTAL_CALLS = envInt('SERPAPI_MAX_CALLS', 12, 1, 100);
+const CONCURRENCY = envInt('SERPAPI_CONCURRENCY', 4, 1, 8);
+const SERP_GL = process.env.SERPAPI_GL || 'us';
+const SERP_HL = process.env.SERPAPI_HL || 'en';
+
+// "best" ranking = generalized cost: money + a price-per-hour for travel time +
+// a penalty per stopover. Tunable without touching the sort logic.
+const TIME_VALUE_PER_HOUR = 35;
+const STOP_PENALTY = 50;
+
+const TRAVEL_CLASS = { economy: 1, premium: 2, business: 3, first: 4 };
+const SERP_SORT = { best: 1, cheapest: 2, fastest: 5 }; // Google Flights sort_by
+const SERP_STOPS = { 0: 1, 1: 2, 2: 3 };                // our maxStops -> Google stops
+
+let _authCache;
+function loadAuth() {
+  if (_authCache !== undefined) return _authCache;
+  try { _authCache = JSON.parse(fs.readFileSync(AUTH_PATH, 'utf8')); }
+  catch { _authCache = null; }
+  return _authCache;
+}
+function serpKey() {
+  if (process.env.SERPAPI_API_KEY) return process.env.SERPAPI_API_KEY;
+  if (process.env.SERPAPI_KEY) return process.env.SERPAPI_KEY;
+  const a = loadAuth();
+  return (a && a.serpapi && a.serpapi.api_key) || '';
 }
 
-// Build a query string from an object OR an array of [key, value] pairs.
-// Arrays allow repeated keys (e.g. several location_types).
+/* --- Embedded location table (autocomplete + name -> codes) ---------------- */
+// [ IATA, City, Country, CountryCode, weight(1-10 importance) ]
+const AIRPORT_ROWS = [
+  // Europe
+  ['ARN','Stockholm','Sweden','SE',8], ['BMA','Stockholm','Sweden','SE',4], ['NYO','Stockholm','Sweden','SE',3],
+  ['GOT','Gothenburg','Sweden','SE',5], ['CPH','Copenhagen','Denmark','DK',9], ['OSL','Oslo','Norway','NO',8],
+  ['HEL','Helsinki','Finland','FI',8], ['ATH','Athens','Greece','GR',8], ['SKG','Thessaloniki','Greece','GR',5],
+  ['HER','Heraklion','Greece','GR',4], ['OTP','Bucharest','Romania','RO',7], ['CLJ','Cluj-Napoca','Romania','RO',4],
+  ['LHR','London','United Kingdom','GB',10], ['LGW','London','United Kingdom','GB',8], ['STN','London','United Kingdom','GB',6],
+  ['LTN','London','United Kingdom','GB',5], ['MAN','Manchester','United Kingdom','GB',7], ['EDI','Edinburgh','United Kingdom','GB',6],
+  ['DUB','Dublin','Ireland','IE',8], ['CDG','Paris','France','FR',10], ['ORY','Paris','France','FR',7],
+  ['NCE','Nice','France','FR',6], ['LYS','Lyon','France','FR',5], ['AMS','Amsterdam','Netherlands','NL',10],
+  ['FRA','Frankfurt','Germany','DE',10], ['MUC','Munich','Germany','DE',9], ['BER','Berlin','Germany','DE',8],
+  ['DUS','Dusseldorf','Germany','DE',7], ['HAM','Hamburg','Germany','DE',6], ['MAD','Madrid','Spain','ES',9],
+  ['BCN','Barcelona','Spain','ES',9], ['AGP','Malaga','Spain','ES',6], ['PMI','Palma','Spain','ES',6],
+  ['VLC','Valencia','Spain','ES',5], ['LIS','Lisbon','Portugal','PT',8], ['OPO','Porto','Portugal','PT',6],
+  ['FCO','Rome','Italy','IT',9], ['MXP','Milan','Italy','IT',8], ['LIN','Milan','Italy','IT',5],
+  ['VCE','Venice','Italy','IT',6], ['NAP','Naples','Italy','IT',5], ['VIE','Vienna','Austria','AT',9],
+  ['ZRH','Zurich','Switzerland','CH',9], ['GVA','Geneva','Switzerland','CH',7], ['BRU','Brussels','Belgium','BE',8],
+  ['WAW','Warsaw','Poland','PL',7], ['KRK','Krakow','Poland','PL',5], ['PRG','Prague','Czechia','CZ',7],
+  ['BUD','Budapest','Hungary','HU',7], ['IST','Istanbul','Turkey','TR',10], ['SAW','Istanbul','Turkey','TR',7],
+  ['AYT','Antalya','Turkey','TR',6], ['SOF','Sofia','Bulgaria','BG',5], ['BEG','Belgrade','Serbia','RS',5],
+  ['ZAG','Zagreb','Croatia','HR',4], ['KEF','Reykjavik','Iceland','IS',5], ['RIX','Riga','Latvia','LV',5],
+  ['TLL','Tallinn','Estonia','EE',4], ['VNO','Vilnius','Lithuania','LT',4],
+  // Middle East / Africa
+  ['DXB','Dubai','United Arab Emirates','AE',10], ['AUH','Abu Dhabi','United Arab Emirates','AE',8],
+  ['DOH','Doha','Qatar','QA',9], ['TLV','Tel Aviv','Israel','IL',7], ['CAI','Cairo','Egypt','EG',7],
+  ['RUH','Riyadh','Saudi Arabia','SA',7], ['JED','Jeddah','Saudi Arabia','SA',7], ['JNB','Johannesburg','South Africa','ZA',8],
+  ['CPT','Cape Town','South Africa','ZA',6], ['NBO','Nairobi','Kenya','KE',6], ['LOS','Lagos','Nigeria','NG',6],
+  ['CMN','Casablanca','Morocco','MA',6], ['ADD','Addis Ababa','Ethiopia','ET',6],
+  // Asia
+  ['SIN','Singapore','Singapore','SG',10], ['HKG','Hong Kong','Hong Kong','HK',10], ['BKK','Bangkok','Thailand','TH',9],
+  ['KUL','Kuala Lumpur','Malaysia','MY',8], ['NRT','Tokyo','Japan','JP',9], ['HND','Tokyo','Japan','JP',9],
+  ['KIX','Osaka','Japan','JP',7], ['ICN','Seoul','South Korea','KR',9], ['PEK','Beijing','China','CN',9],
+  ['PVG','Shanghai','China','CN',9], ['CAN','Guangzhou','China','CN',8], ['DEL','Delhi','India','IN',9],
+  ['BOM','Mumbai','India','IN',9], ['BLR','Bangalore','India','IN',7], ['MAA','Chennai','India','IN',6],
+  ['HYD','Hyderabad','India','IN',6], ['CGK','Jakarta','Indonesia','ID',8], ['DPS','Bali','Indonesia','ID',6],
+  ['MNL','Manila','Philippines','PH',7], ['TPE','Taipei','Taiwan','TW',8], ['CMB','Colombo','Sri Lanka','LK',5],
+  ['MLE','Male','Maldives','MV',5],
+  // Oceania
+  ['SYD','Sydney','Australia','AU',9], ['MEL','Melbourne','Australia','AU',8], ['BNE','Brisbane','Australia','AU',7],
+  ['PER','Perth','Australia','AU',6], ['AKL','Auckland','New Zealand','NZ',7],
+  // North America
+  ['JFK','New York','United States','US',10], ['EWR','New York','United States','US',8], ['LGA','New York','United States','US',6],
+  ['LAX','Los Angeles','United States','US',10], ['SFO','San Francisco','United States','US',9], ['ORD','Chicago','United States','US',9],
+  ['MIA','Miami','United States','US',8], ['DFW','Dallas','United States','US',8], ['ATL','Atlanta','United States','US',9],
+  ['BOS','Boston','United States','US',8], ['SEA','Seattle','United States','US',8], ['IAD','Washington','United States','US',7],
+  ['DCA','Washington','United States','US',6], ['DEN','Denver','United States','US',8], ['LAS','Las Vegas','United States','US',7],
+  ['YYZ','Toronto','Canada','CA',9], ['YVR','Vancouver','Canada','CA',7], ['YUL','Montreal','Canada','CA',7],
+  ['MEX','Mexico City','Mexico','MX',8], ['CUN','Cancun','Mexico','MX',6],
+  // South America
+  ['GRU','Sao Paulo','Brazil','BR',9], ['GIG','Rio de Janeiro','Brazil','BR',7], ['EZE','Buenos Aires','Argentina','AR',8],
+  ['SCL','Santiago','Chile','CL',7], ['BOG','Bogota','Colombia','CO',7], ['LIM','Lima','Peru','PE',7],
+  ['PTY','Panama City','Panama','PA',7],
+];
+const AIRPORTS = AIRPORT_ROWS.map((r) => ({ iata: r[0], city: r[1], country: r[2], cc: r[3], w: r[4] }));
+const byIata = {};
+for (const a of AIRPORTS) byIata[a.iata] = a;
+
+function topCodes(list, n) {
+  return list.slice().sort((a, b) => b.w - a.w).slice(0, n).map((a) => a.iata).join(',');
+}
+
+// Autocomplete: returns suggestions for airports, multi-airport cities, and countries.
+function searchLocations(q, limit) {
+  const low = String(q || '').toLowerCase().trim();
+  if (low.length < 2) return [];
+  const score = (hay) => {
+    hay = String(hay).toLowerCase();
+    if (hay === low) return 100;
+    if (hay.startsWith(low)) return 60;
+    if (hay.includes(low)) return 30;
+    return 0;
+  };
+  const sugg = [];
+  // Countries
+  const countryMap = {};
+  for (const a of AIRPORTS) {
+    const s = score(a.country);
+    if (s > 0) {
+      if (!countryMap[a.cc]) countryMap[a.cc] = { country: a.country, list: [], s };
+      countryMap[a.cc].list.push(a);
+    }
+  }
+  for (const k in countryMap) {
+    const c = countryMap[k];
+    sugg.push({ type: 'country', s: c.s + 6, w: 10, value: topCodes(c.list, 6), label: c.country, sub: 'Country — any airport' });
+  }
+  // Cities (only multi-airport cities get a dedicated "all airports" entry)
+  const cityMap = {};
+  for (const a of AIRPORTS) {
+    const s = score(a.city);
+    if (s > 0) {
+      const ck = a.city + '|' + a.cc;
+      if (!cityMap[ck]) cityMap[ck] = { city: a.city, country: a.country, list: [], s };
+      cityMap[ck].list.push(a);
+      cityMap[ck].s = Math.max(cityMap[ck].s, s);
+    }
+  }
+  for (const k in cityMap) {
+    const c = cityMap[k];
+    if (c.list.length > 1) {
+      sugg.push({ type: 'city', s: c.s + 3, w: Math.max.apply(null, c.list.map((x) => x.w)), value: topCodes(c.list, 3), label: c.city + ' — all airports', sub: c.country });
+    }
+  }
+  // Airports
+  for (const a of AIRPORTS) {
+    const s = Math.max(score(a.iata), score(a.city), score(a.country));
+    if (s > 0) sugg.push({ type: 'airport', s, w: a.w, value: a.iata, label: `${a.city} (${a.iata})`, sub: a.country });
+  }
+  sugg.sort((x, y) => (y.s - x.s) || (y.w - x.w));
+  const seen = new Set();
+  const out = [];
+  for (const x of sugg) {
+    const key = x.type + '|' + x.label;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ type: x.type, value: x.value, label: x.label, sub: x.sub });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+// Turn a typed value (or a code list from the autocomplete) into the
+// comma-separated airport codes that Google Flights expects.
+function resolveToCodes(value) {
+  const v = String(value || '').trim();
+  if (!v) throw { status: 400, body: { error: 'Missing origin or destination' } };
+  if (/^[A-Za-z]{3}(\s*,\s*[A-Za-z]{3})*$/.test(v)) return v.toUpperCase().replace(/\s+/g, '');
+  if (v.startsWith('/m/') || v.startsWith('/g/')) return v; // a Google location id
+  const low = v.toLowerCase();
+  // 2-letter country code
+  if (/^[a-z]{2}$/.test(low)) {
+    const list = AIRPORTS.filter((a) => a.cc === v.toUpperCase());
+    if (list.length) return topCodes(list, 6);
+  }
+  // exact city
+  let hit = AIRPORTS.filter((a) => a.city.toLowerCase() === low);
+  if (hit.length) return topCodes(hit, 3);
+  // exact country name
+  hit = AIRPORTS.filter((a) => a.country.toLowerCase() === low);
+  if (hit.length) return topCodes(hit, 6);
+  // fuzzy
+  hit = AIRPORTS.filter((a) => a.city.toLowerCase().includes(low) || a.country.toLowerCase().includes(low));
+  if (hit.length) return topCodes(hit, 4);
+  throw { status: 400, body: { error: `Could not find a place matching "${value}". Try an airport code (e.g. ARN), a city, or a country.` } };
+}
+
+/* --- SerpApi transport ---------------------------------------------------- */
+
 function buildQS(q) {
   const sp = new URLSearchParams();
   const pairs = Array.isArray(q) ? q : Object.entries(q || {});
@@ -173,213 +325,98 @@ function buildQS(q) {
   return s ? '?' + s : '';
 }
 
-// Promise-based HTTPS call to the provider. Resolves parsed JSON, or rejects
-// with a { status, body } the HTTP layer already knows how to send to clients.
-function apiRequest(method, pathName, { query, body } = {}) {
-  const key = apiKey();
-  if (!key) {
-    return Promise.reject({
-      status: 503,
-      body: { error: 'Flight API key not configured. Set TEQUILA_API_KEY (or FLIGHT_API_KEY).' },
-    });
-  }
-  const host = process.env.TEQUILA_HOST || 'api.tequila.kiwi.com';
-  const payload = body ? JSON.stringify(body) : null;
-  const headers = { apikey: key, Accept: 'application/json' };
-  if (payload) {
-    headers['Content-Type'] = 'application/json';
-    headers['Content-Length'] = Buffer.byteLength(payload);
-  }
+// GET serpapi.com/search.json — resolves { status, json }, rejects on transport.
+function serpGet(query) {
+  const host = process.env.SERPAPI_HOST || 'serpapi.com';
   return new Promise((resolve, reject) => {
-    const req = https.request(
-      { host, path: pathName + buildQS(query), method, headers, timeout: 25000 },
-      (res) => {
-        let data = '';
-        res.on('data', (c) => {
-          data += c;
-          if (data.length > 2e7) { req.destroy(); reject({ status: 502, body: { error: 'Upstream response too large' } }); }
-        });
-        res.on('end', () => {
-          let parsed = null;
-          try { parsed = data ? JSON.parse(data) : {}; } catch { parsed = null; }
-          if (res.statusCode >= 200 && res.statusCode < 300) return resolve(parsed || {});
-          const detail = parsed && (parsed.error || parsed.message);
-          reject({
-            status: 502,
-            body: { error: `Flight provider error (${res.statusCode})${detail ? ': ' + detail : ''}`, upstreamStatus: res.statusCode },
-          });
-        });
-      }
-    );
-    req.on('timeout', () => { req.destroy(); reject({ status: 504, body: { error: 'Flight provider timed out' } }); });
-    req.on('error', (e) => reject({ status: 502, body: { error: 'Could not reach flight provider: ' + e.message } }));
-    if (payload) req.write(payload);
+    const req = https.request({ host, path: '/search.json' + buildQS(query), method: 'GET', timeout: 30000 }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; if (data.length > 3e7) { req.destroy(); reject({ status: 502, body: { error: 'Upstream response too large' } }); } });
+      res.on('end', () => {
+        let json = null;
+        try { json = data ? JSON.parse(data) : null; } catch { json = null; }
+        resolve({ status: res.statusCode, json });
+      });
+    });
+    req.on('timeout', () => { req.destroy(); reject({ status: 504, body: { error: 'SerpApi timed out' } }); });
+    req.on('error', (e) => reject({ status: 502, body: { error: 'Could not reach SerpApi: ' + e.message } }));
     req.end();
   });
 }
 
-/* --- Location resolution / autocomplete ----------------------------------- */
-
-function normLocation(l) {
-  const city = l.city ? l.city.name : (l.type === 'city' ? l.name : null);
-  const country = l.country ? l.country.name : (l.type === 'country' ? l.name : null);
-  const countryCode = l.country ? l.country.code : (l.type === 'country' ? l.code : null);
-  let label, sub;
-  if (l.type === 'airport') { label = `${l.name} (${l.code})`; sub = [city, country].filter(Boolean).join(', '); }
-  else if (l.type === 'city') { label = `${l.name} — all airports`; sub = [country].filter(Boolean).join(', '); }
-  else if (l.type === 'country') { label = l.name; sub = 'Country — any airport'; }
-  else { label = l.name || l.code; sub = [city, country].filter(Boolean).join(', '); }
-  return { value: l.code, code: l.code, type: l.type, name: l.name, city, country, countryCode, label, sub };
+function isAuthError(msg) {
+  return /api[_\s-]?key|unauthor|invalid key|account|run out|plan/i.test(String(msg || ''));
 }
 
-async function providerLocations(term, types, limit) {
-  const q = [['term', term], ['locale', 'en-US'], ['limit', String(limit)], ['active_only', 'true']];
-  for (const t of types) if (TEQUILA_TYPES.has(t)) q.push(['location_types', t]);
-  const r = await apiRequest('GET', '/locations/query', { query: q });
-  return (r.locations || []).map(normLocation);
-}
-
-// Resolve a free-text value OR a canonical code to a provider identifier
-// (airport IATA / city code / country code). Cached per process.
-const resolveCache = new Map();
-async function resolveCode(value) {
-  const v = String(value || '').trim();
-  if (!v) throw { status: 400, body: { error: 'Missing origin or destination' } };
-  // A canonical code coming straight from the autocomplete:
-  //   2 letters = country (GB), 3 letters = airport/city (ARN/STO), or "city:XYZ".
-  if (/^[A-Z]{2,3}$/.test(v) || /^[a-z]+:[A-Za-z]{2,3}$/.test(v)) return v;
-  const cacheKey = v.toLowerCase();
-  if (resolveCache.has(cacheKey)) return resolveCache.get(cacheKey);
-  const matches = await providerLocations(v, ['city', 'airport', 'country'], 5);
-  if (!matches.length) throw { status: 400, body: { error: `Could not find a place matching "${value}"` } };
-  // For free text, prefer the broadest sensible match: city, then country, then airport.
-  const order = { city: 0, country: 1, airport: 2 };
-  matches.sort((a, b) => (order[a.type] ?? 9) - (order[b.type] ?? 9));
-  const code = matches[0].code;
-  resolveCache.set(cacheKey, code);
-  return code;
-}
-
-/* --- Provider search calls ------------------------------------------------ */
-
-async function providerSearch(o) {
-  const q = [
-    ['fly_from', o.from], ['fly_to', o.to],
-    ['date_from', toDMY(o.dateFrom)], ['date_to', toDMY(o.dateTo)],
-    ['flight_type', o.flightType],
-    ['adults', o.pax.adults], ['children', o.pax.children], ['infants', o.pax.infants],
-    ['selected_cabins', CABIN_CODES[o.cabin] || 'M'],
-    ['curr', o.currency], ['locale', 'en'], ['limit', o.limit || 40],
-    ['sort', SORT_CODES[o.sort] || 'quality'], ['vehicle_type', 'aircraft'],
-  ];
-  if (o.flightType === 'round') {
-    q.push(['return_from', toDMY(o.returnFrom)], ['return_to', toDMY(o.returnTo)]);
-  }
-  if (o.maxStops != null) q.push(['max_stopovers', o.maxStops]);
-  const r = await apiRequest('GET', '/v2/search', { query: q });
-  return r.data || [];
-}
-
-async function providerMulti(requests, o) {
-  const body = {
-    requests: requests.map((rq) => {
-      const r = {
-        fly_from: rq.from, fly_to: rq.to,
-        date_from: toDMY(rq.dateFrom), date_to: toDMY(rq.dateTo),
-        adults: o.pax.adults, children: o.pax.children, infants: o.pax.infants,
-        selected_cabins: CABIN_CODES[o.cabin] || 'M',
-      };
-      if (o.maxStops != null) r.max_stopovers = o.maxStops;
-      return r;
-    }),
+// One Google Flights one-way search. Returns the raw JSON, or null when the
+// provider simply has no flights for that day (so one empty day doesn't fail
+// the whole search). Throws on auth/transport errors.
+async function serpOneWay(from, to, date, o) {
+  const query = {
+    engine: 'google_flights', api_key: serpKey(), type: 2,
+    departure_id: from, arrival_id: to, outbound_date: date,
+    travel_class: TRAVEL_CLASS[o.cabin] || 1,
+    adults: o.pax.adults, children: o.pax.children, infants_in_seat: o.pax.infants,
+    currency: o.currency, hl: SERP_HL, gl: SERP_GL,
+    sort_by: SERP_SORT[o.sort] || 1,
   };
-  const q = [['curr', o.currency], ['locale', 'en'], ['limit', o.limit || 40], ['sort', 'quality']];
-  const r = await apiRequest('POST', '/v2/flights_multi', { query: q, body });
-  return Array.isArray(r) ? r : (r.data || []);
-}
-
-/* --- Normalization: provider payload -> slice-based itineraries ----------- */
-
-function segDurationMin(s) {
-  const a = Date.parse(s.utc_arrival || s.local_arrival);
-  const d = Date.parse(s.utc_departure || s.local_departure);
-  return (Number.isFinite(a) && Number.isFinite(d)) ? Math.max(0, Math.round((a - d) / 60000)) : 0;
-}
-
-function normSegment(s) {
-  return {
-    from: s.flyFrom, to: s.flyTo,
-    fromCity: s.cityFrom, toCity: s.cityTo,
-    carrier: s.airline,
-    flightNo: `${s.airline || ''}${s.flight_no != null ? s.flight_no : ''}`,
-    depart: s.local_departure, arrive: s.local_arrival,
-    durationMin: segDurationMin(s),
-  };
-}
-
-function sliceFrom(segs) {
-  const segments = segs.map(normSegment);
-  const first = segs[0], last = segs[segs.length - 1];
-  const dep = Date.parse(first.utc_departure || first.local_departure);
-  const arr = Date.parse(last.utc_arrival || last.local_arrival);
-  const durationMin = (Number.isFinite(arr) && Number.isFinite(dep))
-    ? Math.round((arr - dep) / 60000)
-    : segments.reduce((a, s) => a + s.durationMin, 0);
-  return {
-    from: first.flyFrom, to: last.flyTo,
-    fromCity: first.cityFrom, toCity: last.cityTo,
-    date: String(first.local_departure || '').slice(0, 10),
-    stops: Math.max(0, segs.length - 1),
-    durationMin, segments,
-  };
-}
-
-// Multi-city: split a flat route into one slice per requested leg by matching
-// each leg's destination code (airport / city / country) against the segments.
-function splitByDest(route, destCodes) {
-  const slices = [];
-  let cur = [], idx = 0;
-  for (const s of route) {
-    cur.push(s);
-    const target = String(destCodes[idx] || '').toUpperCase();
-    const reached = target && [s.flyTo, s.cityCodeTo, s.countryTo && s.countryTo.code]
-      .filter(Boolean)
-      .map((x) => String(x).toUpperCase())
-      .includes(target);
-    if (reached && idx < destCodes.length - 1) { slices.push(sliceFrom(cur)); cur = []; idx++; }
+  if (o.maxStops != null && SERP_STOPS[o.maxStops]) query.stops = SERP_STOPS[o.maxStops];
+  const { status, json } = await serpGet(query);
+  if (status === 401 || status === 403) throw { status: 502, body: { error: 'SerpApi rejected the API key (check auth.json / SERPAPI_API_KEY).' } };
+  if (json && json.error) {
+    if (isAuthError(json.error)) throw { status: 502, body: { error: 'SerpApi: ' + json.error } };
+    return null; // e.g. "hasn't returned any results for this query"
   }
-  if (cur.length) slices.push(sliceFrom(cur));
-  return slices;
+  if (status >= 400 && !json) throw { status: 502, body: { error: `SerpApi error (HTTP ${status})` } };
+  return json;
 }
 
-function buildSlices(route, kind, destCodes) {
-  if (!route || !route.length) return [];
-  if (kind === 'round') {
-    const out = route.filter((s) => !s.return);
-    const back = route.filter((s) => s.return);
-    return [out.length ? sliceFrom(out) : null, back.length ? sliceFrom(back) : null].filter(Boolean);
-  }
-  if (kind === 'multicity') return splitByDest(route, destCodes);
-  return [sliceFrom(route)];
-}
+/* --- Normalization: SerpApi option -> slice-based itinerary --------------- */
 
+function isoLocal(t) {
+  if (!t) return '';
+  t = String(t);
+  return t.includes('T') ? t : t.replace(' ', 'T');
+}
+function cityOf(ap) {
+  if (!ap) return '';
+  return (byIata[ap.id] && byIata[ap.id].city) || ap.name || ap.id || '';
+}
 function generalizedCost(it) {
   return it.price + (it.totalDurationMin / 60) * TIME_VALUE_PER_HOUR + it.totalStops * STOP_PENALTY;
 }
 
-function normItin(d, kind, destCodes, paxCount, currency) {
-  const slices = buildSlices(d.route || [], kind, destCodes);
-  const totalDurationMin = slices.reduce((a, s) => a + s.durationMin, 0);
-  const totalStops = slices.reduce((a, s) => a + s.stops, 0);
-  const price = Math.round(d.price);
+// A SerpApi flight option -> a single-slice itinerary (one leg / one direction).
+function normOption(o, paxCount, currency, fallbackDate) {
+  const fl = o.flights || [];
+  if (!fl.length) return null;
+  const segments = fl.map((f) => ({
+    from: f.departure_airport && f.departure_airport.id,
+    to: f.arrival_airport && f.arrival_airport.id,
+    fromCity: cityOf(f.departure_airport),
+    toCity: cityOf(f.arrival_airport),
+    carrier: f.airline,
+    flightNo: f.flight_number,
+    depart: isoLocal(f.departure_airport && f.departure_airport.time),
+    arrive: isoLocal(f.arrival_airport && f.arrival_airport.time),
+    durationMin: f.duration || 0,
+  }));
+  const layovers = o.layovers || [];
+  const durationMin = o.total_duration ||
+    (segments.reduce((a, s) => a + s.durationMin, 0) + layovers.reduce((a, l) => a + (l.duration || 0), 0));
+  const date = (segments[0].depart || '').slice(0, 10) || fallbackDate;
+  const slice = {
+    from: segments[0].from, to: segments[segments.length - 1].to,
+    fromCity: segments[0].fromCity, toCity: segments[segments.length - 1].toCity,
+    date, stops: Math.max(0, segments.length - 1), durationMin, segments,
+  };
+  const price = Math.round(o.price || 0);
   const it = {
-    id: d.id || d.booking_token || `${price}-${totalDurationMin}`,
-    price,
-    pricePerPax: Math.round(price / Math.max(1, paxCount)),
-    currency,
-    bookingUrl: d.deep_link || null,
-    seats: d.availability ? d.availability.seats : null,
-    slices, totalDurationMin, totalStops,
+    id: o.booking_token || o.departure_token || `${price}-${durationMin}-${segments[0].flightNo || ''}-${date}`,
+    price, pricePerPax: Math.round(price / Math.max(1, paxCount)), currency,
+    bookingUrl: null, seats: null,
+    slices: [slice], totalDurationMin: durationMin, totalStops: slice.stops,
+    _date: date,
   };
   it.score = generalizedCost(it);
   return it;
@@ -392,17 +429,82 @@ function sortItins(list, sort) {
   else arr.sort((a, b) => a.score - b.score);
   return arr;
 }
-
 function topPicks(list) {
   if (!list.length) return { best: null, cheapest: null, fastest: null };
   const by = (f) => list.reduce((m, x) => (f(x) < f(m) ? x : m));
-  return {
-    best: by((x) => x.score),
-    cheapest: by((x) => x.price),
-    fastest: by((x) => x.totalDurationMin),
-  };
+  return { best: by((x) => x.score), cheapest: by((x) => x.price), fastest: by((x) => x.totalDurationMin) };
 }
 
+// Merge one chosen option per leg into a single multi-slice itinerary.
+function mergeItins(picks, paxCount, currency) {
+  const slices = picks.map((p) => p.slices[0]);
+  const price = picks.reduce((a, p) => a + p.price, 0);
+  const totalDurationMin = picks.reduce((a, p) => a + p.totalDurationMin, 0);
+  const totalStops = picks.reduce((a, p) => a + p.totalStops, 0);
+  const it = {
+    id: picks.map((p) => p.id).join('|'),
+    price, pricePerPax: Math.round(price / Math.max(1, paxCount)), currency,
+    bookingUrl: null, seats: null,
+    slices, totalDurationMin, totalStops,
+  };
+  it.score = generalizedCost(it);
+  return it;
+}
+
+// Combine per-leg option lists into bounded, diverse multi-slice itineraries.
+// Uses rank alignment across three metrics so cheapest/fastest/best combos all
+// appear, without exploding into a full cartesian product.
+function combineLegs(legsOptions, sort, paxCount, currency) {
+  if (!legsOptions.length || legsOptions.some((l) => !l.length)) return [];
+  const seen = new Set();
+  const combined = [];
+  for (const metric of ['cheapest', 'fastest', 'best']) {
+    const sorted = legsOptions.map((l) => sortItins(l, metric));
+    const K = Math.min(8, Math.min.apply(null, sorted.map((s) => s.length)));
+    for (let i = 0; i < K; i++) {
+      const it = mergeItins(sorted.map((s) => s[i]), paxCount, currency);
+      if (!seen.has(it.id)) { seen.add(it.id); combined.push(it); }
+    }
+  }
+  return sortItins(combined, sort).slice(0, 50);
+}
+
+function googleFlightsUrl(slices, tripType) {
+  const f = slices[0];
+  const place = (s, end) => (end === 'from' ? (s.fromCity || s.from) : (s.toCity || s.to));
+  let q;
+  if (tripType === 'round' && slices.length >= 2) {
+    q = `Flights from ${place(f, 'from')} to ${place(f, 'to')} on ${f.date} returning ${slices[1].date}`;
+  } else if (slices.length > 1) {
+    q = 'Flights ' + slices.map((s) => `${place(s, 'from')} to ${place(s, 'to')} on ${s.date}`).join(', then ');
+  } else {
+    q = `Flights from ${place(f, 'from')} to ${place(f, 'to')} on ${f.date}`;
+  }
+  return 'https://www.google.com/travel/flights?q=' + encodeURIComponent(q);
+}
+
+/* --- Date / passenger helpers --------------------------------------------- */
+
+function clampInt(v, lo, hi, dflt) {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n)) return dflt;
+  return Math.max(lo, Math.min(hi, n));
+}
+function parseDateUTC(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || '').trim());
+  if (!m) throw { status: 400, body: { error: `Invalid date "${s}", expected YYYY-MM-DD` } };
+  return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+}
+function fmtDateUTC(d) { return d.toISOString().slice(0, 10); }
+function enumerateDates(from, to, cap) {
+  const a = parseDateUTC(from);
+  let b = to ? parseDateUTC(to) : a;
+  if (b < a) b = a;
+  const out = [];
+  const d = new Date(a.getTime());
+  while (d <= b && out.length < cap) { out.push(fmtDateUTC(d)); d.setUTCDate(d.getUTCDate() + 1); }
+  return out.length ? out : [fmtDateUTC(a)];
+}
 function normPax(p) {
   if (typeof p === 'number') return { adults: clampInt(p, 1, 9, 1), children: 0, infants: 0 };
   p = p || {};
@@ -412,12 +514,46 @@ function normPax(p) {
     infants: clampInt(p.infants, 0, 9, 0),
   };
 }
-
 function normMaxStops(v) {
   if (v === 0 || v === '0') return 0;
   if (v === 1 || v === '1') return 1;
   if (v === 2 || v === '2') return 2;
-  return null; // "any"
+  return null;
+}
+async function mapPool(items, n, fn) {
+  const ret = new Array(items.length);
+  let i = 0;
+  async function worker() { while (i < items.length) { const idx = i++; ret[idx] = await fn(items[idx], idx); } }
+  const workers = [];
+  for (let k = 0; k < Math.min(n, items.length); k++) workers.push(worker());
+  await Promise.all(workers);
+  return ret;
+}
+
+/* --- Leg search ----------------------------------------------------------- */
+
+// All options for one leg across its (capped) date interval.
+async function searchLeg(from, to, dateFrom, dateTo, o) {
+  const dates = enumerateDates(dateFrom, dateTo, o.dayCap);
+  const lists = await mapPool(dates, CONCURRENCY, async (d) => {
+    const json = await serpOneWay(from, to, d, o);
+    if (!json) return [];
+    const arr = (json.best_flights || []).concat(json.other_flights || []);
+    const out = [];
+    for (const op of arr) { const it = normOption(op, o.paxCount, o.currency, d); if (it) out.push(it); }
+    return out;
+  });
+  const seen = new Set();
+  const dedup = [];
+  for (const l of lists) {
+    for (const it of l) {
+      const sig = it._date + '|' + it.slices[0].segments.map((s) => s.flightNo).join(',') + '|' + it.price;
+      if (seen.has(sig)) continue;
+      seen.add(sig);
+      dedup.push(it);
+    }
+  }
+  return sortItins(dedup, o.sort).slice(0, 40);
 }
 
 /* --- Request handlers: flight finder -------------------------------------- */
@@ -428,13 +564,9 @@ function home() {
     body: {
       name: 'Flight Finder',
       ui: '/search',
-      api: {
-        health: 'GET /api/health',
-        locations: 'GET /api/locations?q=...',
-        search: 'POST /api/search',
-      },
-      provider: 'tequila',
-      apiKeyConfigured: !!apiKey(),
+      api: { health: 'GET /api/health', locations: 'GET /api/locations?q=...', search: 'POST /api/search' },
+      provider: 'serpapi (google flights)',
+      apiKeyConfigured: !!serpKey(),
     },
   };
 }
@@ -444,16 +576,17 @@ function health() {
     status: 200,
     body: {
       status: 'ok',
-      provider: 'tequila',
-      host: process.env.TEQUILA_HOST || 'api.tequila.kiwi.com',
-      apiKeyConfigured: !!apiKey(),
+      provider: 'serpapi (google flights)',
+      host: process.env.SERPAPI_HOST || 'serpapi.com',
+      apiKeyConfigured: !!serpKey(),
+      keySource: process.env.SERPAPI_API_KEY || process.env.SERPAPI_KEY ? 'env'
+        : (loadAuth() && loadAuth().serpapi && loadAuth().serpapi.api_key ? 'auth.json' : 'none'),
+      caps: { maxRangeDays: MAX_RANGE_DAYS, maxCallsPerSearch: MAX_TOTAL_CALLS, concurrency: CONCURRENCY },
       endpoints: Object.keys(endpoints),
     },
   };
 }
 
-// Serves the single self-contained search page. Read fresh each request so
-// edits to search.html show up without a restart.
 function searchPage() {
   try {
     return { status: 200, type: 'html', body: fs.readFileSync(SEARCH_HTML_PATH, 'utf8') };
@@ -462,18 +595,15 @@ function searchPage() {
   }
 }
 
-async function locations(args) {
+function locations(args) {
   const term = String(args.q || '').trim();
-  if (term.length < 2) return { status: 200, body: { locations: [] } };
-  const types = String(args.types || 'airport,city,country').split(',').map((s) => s.trim()).filter(Boolean);
   const limit = clampInt(args.limit, 1, 25, 10);
-  const locs = await providerLocations(term, types, limit);
-  return { status: 200, body: { locations: locs } };
+  return { status: 200, body: { locations: searchLocations(term, limit) } };
 }
 
 async function searchFlights(args) {
-  if (!apiKey()) {
-    throw { status: 503, body: { error: 'Flight API key not configured. Set TEQUILA_API_KEY (or FLIGHT_API_KEY) to enable search.' } };
+  if (!serpKey()) {
+    throw { status: 503, body: { error: 'No SerpApi key configured. Add it to auth.json ({ "serpapi": { "api_key": "..." } }) or set SERPAPI_API_KEY, then restart.' } };
   }
 
   const trips = Array.isArray(args.trips) ? args.trips : [];
@@ -482,70 +612,61 @@ async function searchFlights(args) {
 
   const pax = normPax(args.passengers);
   const paxCount = pax.adults + pax.children + pax.infants;
-  const cabin = CABIN_CODES[args.cabin] ? args.cabin : 'economy';
-  const sort = SORT_CODES[args.sort] ? args.sort : 'best';
+  const cabin = TRAVEL_CLASS[args.cabin] ? args.cabin : 'economy';
+  const sort = SERP_SORT[args.sort] ? args.sort : 'best';
   const currency = /^[A-Za-z]{3}$/.test(args.currency || '') ? String(args.currency).toUpperCase() : 'EUR';
   const maxStops = normMaxStops(args.maxStops);
 
   let tripType = ['oneway', 'round', 'multicity'].includes(args.tripType) ? args.tripType : null;
   if (!tripType) tripType = trips.length > 1 ? 'multicity' : (trips[0].returnFrom ? 'round' : 'oneway');
 
-  let raw = [];
-  let destCodes = [];
-  let queryLegs = [];
-
-  if (tripType === 'multicity') {
-    const requests = [];
-    for (const t of trips) {
-      const from = await resolveCode(t.from);
-      const to = await resolveCode(t.to);
-      const dateFrom = t.dateFrom;
-      const dateTo = t.dateTo || t.dateFrom;
-      requests.push({ from, to, dateFrom, dateTo });
-      destCodes.push(to);
-      queryLegs.push({ from, to, dateFrom, dateTo });
-    }
-    raw = await providerMulti(requests, { pax, cabin, currency, maxStops, limit: 50 });
-  } else if (tripType === 'round') {
+  // Build the list of legs to search (each becomes one-way searches).
+  const legSpecs = [];
+  if (tripType === 'round') {
     const t = trips[0];
-    const from = await resolveCode(t.from);
-    const to = await resolveCode(t.to);
-    const dateFrom = t.dateFrom;
-    const dateTo = t.dateTo || t.dateFrom;
-    const returnFrom = t.returnFrom || t.dateTo || t.dateFrom;
-    const returnTo = t.returnTo || returnFrom;
-    raw = await providerSearch({ from, to, dateFrom, dateTo, returnFrom, returnTo, flightType: 'round', pax, cabin, sort, maxStops, currency, limit: 50 });
-    destCodes = [to, from];
-    queryLegs = [
-      { from, to, dateFrom, dateTo },
-      { from: to, to: from, dateFrom: returnFrom, dateTo: returnTo },
-    ];
-  } else { // oneway
+    legSpecs.push({ from: t.from, to: t.to, dateFrom: t.dateFrom, dateTo: t.dateTo || t.dateFrom });
+    legSpecs.push({ from: t.to, to: t.from, dateFrom: t.returnFrom || t.dateTo || t.dateFrom, dateTo: t.returnTo || t.returnFrom || t.dateTo || t.dateFrom });
+  } else if (tripType === 'multicity') {
+    for (const t of trips) legSpecs.push({ from: t.from, to: t.to, dateFrom: t.dateFrom, dateTo: t.dateTo || t.dateFrom });
+  } else {
     const t = trips[0];
-    const from = await resolveCode(t.from);
-    const to = await resolveCode(t.to);
-    const dateFrom = t.dateFrom;
-    const dateTo = t.dateTo || t.dateFrom;
-    raw = await providerSearch({ from, to, dateFrom, dateTo, flightType: 'oneway', pax, cabin, sort, maxStops, currency, limit: 50 });
-    destCodes = [to];
-    queryLegs = [{ from, to, dateFrom, dateTo }];
+    legSpecs.push({ from: t.from, to: t.to, dateFrom: t.dateFrom, dateTo: t.dateTo || t.dateFrom });
   }
 
-  const itineraries = sortItins(
-    raw.map((d) => normItin(d, tripType, destCodes, paxCount, currency)).filter((it) => it.slices.length),
-    sort
-  );
+  // Resolve places -> codes, and bound the per-leg day count so the total
+  // number of API calls never exceeds MAX_TOTAL_CALLS.
+  const dayCap = Math.max(1, Math.min(MAX_RANGE_DAYS, Math.floor(MAX_TOTAL_CALLS / legSpecs.length)));
+  let truncated = false;
+  for (const leg of legSpecs) {
+    leg.fromCode = resolveToCodes(leg.from);
+    leg.toCode = resolveToCodes(leg.to);
+    const requested = enumerateDates(leg.dateFrom, leg.dateTo, 999).length;
+    if (requested > dayCap) truncated = true;
+  }
+
+  const opts = { pax, paxCount, cabin, sort, currency, maxStops, dayCap };
+  const legResults = await mapPool(legSpecs, CONCURRENCY, (leg) =>
+    searchLeg(leg.fromCode, leg.toCode, leg.dateFrom, leg.dateTo, opts));
+
+  let itineraries;
+  if (tripType === 'oneway') itineraries = legResults[0] || [];
+  else itineraries = combineLegs(legResults, sort, paxCount, currency);
+  itineraries = sortItins(itineraries, sort).slice(0, 50);
+  for (const it of itineraries) it.bookingUrl = googleFlightsUrl(it.slices, tripType);
+
+  const notes = [];
+  if (truncated) notes.push(`Date ranges were capped to ${dayCap} day(s) per leg to limit API usage (configurable via SERPAPI_MAX_RANGE_DAYS / SERPAPI_MAX_CALLS).`);
+  if (tripType === 'round' || tripType === 'multicity') notes.push('Each leg is priced as a separate one-way fare; airline round-trip fares may differ.');
 
   return {
     status: 200,
     body: {
-      query: { tripType, cabin, sort, currency, passengers: pax, legs: queryLegs },
-      results: {
-        count: itineraries.length,
-        itineraries: itineraries.slice(0, 50),
-        topPicks: topPicks(itineraries),
+      query: {
+        tripType, cabin, sort, currency, passengers: pax,
+        legs: legSpecs.map((l) => ({ from: l.fromCode, to: l.toCode, dateFrom: l.dateFrom, dateTo: l.dateTo })),
       },
-      meta: { provider: 'tequila', currency, generatedAt: new Date().toISOString() },
+      results: { count: itineraries.length, itineraries, topPicks: topPicks(itineraries) },
+      meta: { provider: 'serpapi', currency, generatedAt: new Date().toISOString(), notes },
     },
   };
 }
@@ -554,25 +675,20 @@ async function searchFlights(args) {
 
 function listItems(args, db) {
   const q = args.q.toLowerCase();
-  const items = q
-    ? db.items.filter((it) => String(it.name).toLowerCase().includes(q))
-    : db.items;
+  const items = q ? db.items.filter((it) => String(it.name).toLowerCase().includes(q)) : db.items;
   return { status: 200, body: items };
 }
-
 function getItem(args, db) {
   const item = db.items.find((it) => it.id === args.id);
   if (!item) return { status: 404, body: { error: 'Item not found' } };
   return { status: 200, body: item };
 }
-
 function createItem(args, db) {
   const item = { id: String(db._meta.nextId++), name: args.name, value: args.value };
   db.items.push(item);
   saveDb(db);
   return { status: 201, body: item };
 }
-
 function updateItem(args, db) {
   const item = db.items.find((it) => it.id === args.id);
   if (!item) return { status: 404, body: { error: 'Item not found' } };
@@ -581,7 +697,6 @@ function updateItem(args, db) {
   saveDb(db);
   return { status: 200, body: item };
 }
-
 function deleteItem(args, db) {
   const index = db.items.findIndex((it) => it.id === args.id);
   if (index === -1) return { status: 404, body: { error: 'Item not found' } };
@@ -601,21 +716,13 @@ const handlers = {
 function coerce(value, type) {
   if (value === undefined || value === null) return value;
   switch (type) {
-    case 'number': {
-      const n = Number(value);
-      return Number.isNaN(n) ? value : n;
-    }
-    case 'boolean':
-      return value === true || value === 'true' || value === '1';
-    case 'string':
-      return String(value);
-    default:
-      return value;
+    case 'number': { const n = Number(value); return Number.isNaN(n) ? value : n; }
+    case 'boolean': return value === true || value === 'true' || value === '1';
+    case 'string': return String(value);
+    default: return value;
   }
 }
 
-// Builds `args` for an endpoint from its declared param names.
-// Throws { status, body } on a validation error (missing required param).
 function resolveParams(names, sources) {
   const args = {};
   for (const name of names) {
@@ -624,8 +731,6 @@ function resolveParams(names, sources) {
 
     let raw = sources[spec.source] ? sources[spec.source][name] : undefined;
 
-    // For scalar body params an empty string counts as missing; objects/arrays
-    // (type 'any') are passed through as-is.
     const isEmpty = raw === undefined || (raw === '' && spec.type !== 'any');
     if (isEmpty) {
       if (spec.required) throw { status: 400, body: { error: `Missing required param "${name}"` } };
@@ -640,23 +745,16 @@ function resolveParams(names, sources) {
 
 function matchRoute(method, pathname) {
   const reqParts = pathname.split('/').filter(Boolean);
-
   for (const key of Object.keys(endpoints)) {
     const [routeMethod, routePath] = key.split(/\s+/);
     if (routeMethod !== method) continue;
-
     const routeParts = routePath.split('/').filter(Boolean);
     if (routeParts.length !== reqParts.length) continue;
-
     const captured = {};
     let matched = true;
     for (let i = 0; i < routeParts.length; i++) {
-      if (routeParts[i].startsWith(':')) {
-        captured[routeParts[i].slice(1)] = decodeURIComponent(reqParts[i]);
-      } else if (routeParts[i] !== reqParts[i]) {
-        matched = false;
-        break;
-      }
+      if (routeParts[i].startsWith(':')) captured[routeParts[i].slice(1)] = decodeURIComponent(reqParts[i]);
+      else if (routeParts[i] !== reqParts[i]) { matched = false; break; }
     }
     if (matched) return { route: endpoints[key], params: captured };
   }
@@ -668,17 +766,10 @@ function matchRoute(method, pathname) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', (chunk) => {
-      data += chunk;
-      if (data.length > 1e6) reject({ status: 413, body: { error: 'Payload too large' } });
-    });
+    req.on('data', (chunk) => { data += chunk; if (data.length > 1e6) reject({ status: 413, body: { error: 'Payload too large' } }); });
     req.on('end', () => {
       if (!data) return resolve({});
-      try {
-        resolve(JSON.parse(data));
-      } catch {
-        reject({ status: 400, body: { error: 'Invalid JSON body' } });
-      }
+      try { resolve(JSON.parse(data)); } catch { reject({ status: 400, body: { error: 'Invalid JSON body' } }); }
     });
     req.on('error', reject);
   });
@@ -686,9 +777,7 @@ function readBody(req) {
 
 function send(res, status, body, type) {
   if (type === 'html' || type === 'text') {
-    res.writeHead(status, {
-      'Content-Type': type === 'html' ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8',
-    });
+    res.writeHead(status, { 'Content-Type': type === 'html' ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8' });
     res.end(typeof body === 'string' ? body : String(body));
     return;
   }
@@ -701,7 +790,6 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const match = matchRoute(req.method, url.pathname);
-
     if (!match) return send(res, 404, { error: 'Not found' });
 
     const body = ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readBody(req) : {};
@@ -724,11 +812,14 @@ if (require.main === module) {
   server.listen(PORT, () => {
     console.log(`Flight Finder listening on http://localhost:${PORT}`);
     console.log(`  Open the search UI:  http://localhost:${PORT}/search`);
-    if (!apiKey()) {
-      console.log('  WARNING: no flight API key set. Search is disabled until you set');
-      console.log('           TEQUILA_API_KEY (or FLIGHT_API_KEY) and restart.');
+    if (!serpKey()) {
+      console.log('  WARNING: no SerpApi key found. Add it to auth.json or set');
+      console.log('           SERPAPI_API_KEY, then restart. Search is disabled until then.');
     }
   });
 }
 
-module.exports = { handlers, buildSlices, normItin, sortItins, topPicks, toDMY, server };
+module.exports = {
+  handlers, normOption, combineLegs, mergeItins, sortItins, topPicks,
+  enumerateDates, resolveToCodes, searchLocations, googleFlightsUrl, server,
+};

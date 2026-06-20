@@ -4,11 +4,11 @@
 
 Built on the zero-dependency Node.js HTTP template (core.js). It serves an
 interactive search page at /search and a small JSON API. Flight data is fetched
-LIVE from the Kiwi.com Tequila API.
+LIVE from SerpApi's Google Flights engine (https://serpapi.com/google-flights-api).
 
 What it does:
   - search city -> city, city -> country, country -> city, country -> country
-  - search a single day OR a date interval (earliest/latest departure)
+  - search a single day OR a date interval (earliest..latest departure)
   - round trips with outbound AND return date intervals
   - multi-city itineraries (e.g. Stockholm-Athens-Bucharest-Stockholm),
     each leg with its own date interval
@@ -17,68 +17,107 @@ What it does:
 -------------------------------------------------------------------------------
  FILES
 -------------------------------------------------------------------------------
-  core.js       The whole backend: routes, the flight provider + engine, the
-                HTTP runtime. Same 3-section layout as the base template.
+  core.js       Backend: routes, the SerpApi provider + engine, the runtime.
+                Also holds a small embedded airport/city/country table used for
+                autocomplete and for turning a typed city/country into airport
+                codes (see "How locations work" below).
   search.html   The entire web UI (HTML + CSS + JS, all inline, no build step).
+  auth.json     Secrets (SerpApi key). git-ignored + docker-ignored. NOT
+                committed. See "SETUP".
   db.json       The template's tiny demo "items" store (unrelated to flights).
                 Flight results are live and are NOT persisted.
   docs.txt      This file.
 
 -------------------------------------------------------------------------------
- SETUP — API KEY (required for live search)
+ SETUP — SerpApi key (required for live search)
 -------------------------------------------------------------------------------
-  Live search needs a Kiwi.com Tequila API key. Get one at
-  https://tequila.kiwi.com and provide it via environment variable:
+  Get a key at https://serpapi.com. The server reads it in this order:
 
-      TEQUILA_API_KEY=your_key_here        (alias also accepted: FLIGHT_API_KEY)
+    1. SERPAPI_API_KEY (or SERPAPI_KEY) environment variable
+    2. auth.json at the project root:
 
-  Optional:
-      TEQUILA_HOST=api.tequila.kiwi.com    (override the provider host)
-      PORT=3000                            (HTTP port, default 3000)
+         {
+           "serpapi": {
+             "provider": "serpapi.com",
+             "api_key": "<your-serpapi-key>"
+           }
+         }
+
+  auth.json is git-ignored (.gitignore) and excluded from the Docker image
+  (.dockerignore), so it must NEVER be committed. In Docker, pass the key as
+  the SERPAPI_API_KEY environment variable instead of relying on the file.
 
   The server still BOOTS without a key — but every search returns HTTP 503 and
   the /search page shows a "configure key" banner until a key is set.
 
+  NOTE: changing auth.json requires a restart (the parsed key is cached).
+
 -------------------------------------------------------------------------------
- SECRETS — auth.json (NOT committed)
+ QUOTA GUARDS (important — SerpApi is metered)
 -------------------------------------------------------------------------------
-  Provider credentials live in auth.json at the project root. This file is
-  git-ignored (see .gitignore) and excluded from the Docker image (see
-  .dockerignore), so it must NEVER be committed. Create it manually per machine.
+  Google Flights searches ONE date at a time, so a date interval is fanned out
+  into one SerpApi call per day, per leg. To protect your SerpApi quota the
+  number of calls per search is bounded (all env-overridable):
 
-  Current shape:
+    SERPAPI_MAX_RANGE_DAYS   max days searched per leg interval   (default 3)
+    SERPAPI_MAX_CALLS        hard cap on API calls per search     (default 12)
+    SERPAPI_CONCURRENCY      parallel API calls                   (default 4)
+    SERPAPI_GL / SERPAPI_HL  Google country / language            (default us/en)
+    SERPAPI_HOST             override host                        (default serpapi.com)
 
-      {
-        "serpapi": {
-          "provider": "serpapi.com",
-          "api_key": "<your-serpapi-key>",
-          "note": "..."
-        }
-      }
-
-  - serpapi.api_key  A SerpApi (https://serpapi.com) key. Reserved for a FUTURE
-    implementation that sources Google Flights data via SerpApi
-    (engine=google_flights) as an alternative/complement to the Tequila
-    provider. core.js does NOT read auth.json yet — the live Tequila provider
-    is still driven by the TEQUILA_API_KEY / FLIGHT_API_KEY env vars above.
-
-  When wiring SerpApi later: load auth.json at startup (fall back to a
-  SERPAPI_API_KEY env var), and add a provider adapter alongside
-  providerSearch()/providerMulti() in core.js.
+  Per-leg day count = min(SERPAPI_MAX_RANGE_DAYS, floor(SERPAPI_MAX_CALLS/legs)).
+  If a requested interval is wider than that, results say so via meta.notes and
+  only the first N days of the interval are searched. A single-day search costs
+  exactly 1 call per leg. Identical queries are cached by SerpApi for ~1h at no
+  extra cost.
 
 -------------------------------------------------------------------------------
  RUNNING
 -------------------------------------------------------------------------------
-  Locally:
-      TEQUILA_API_KEY=xxxx node core.js
-      # then open http://localhost:3000/search
+  Locally (key in auth.json):       node core.js
+  Locally (key in env):             SERPAPI_API_KEY=xxxx node core.js
+                                    # then open http://localhost:3000/search
 
   Docker:
       docker build -t flight-finder .
-      docker run -p 3000:3000 -e TEQUILA_API_KEY=xxxx flight-finder
+      docker run -p 3000:3000 -e SERPAPI_API_KEY=xxxx flight-finder
 
-  docker compose (reads TEQUILA_API_KEY from your shell env or a .env file):
-      TEQUILA_API_KEY=xxxx docker compose up
+  docker compose (reads SERPAPI_API_KEY from your shell env or a .env file):
+      SERPAPI_API_KEY=xxxx docker compose up
+
+-------------------------------------------------------------------------------
+ HOW LOCATIONS WORK
+-------------------------------------------------------------------------------
+  SerpApi/Google Flights takes airport codes (e.g. ARN), comma-separated
+  airport codes (e.g. ARN,BMA,NYO), or Google location ids (/m/...). It has no
+  place-autocomplete endpoint, so core.js embeds a compact airport/city/country
+  table used only to:
+
+    - power GET /api/locations (the search box autocomplete), and
+    - expand a typed CITY  -> that city's airport codes (top 3), and
+                     COUNTRY -> that country's top airport codes (top 6).
+
+  So "Greece" becomes e.g. ATH,SKG,HER and Google Flights returns flights to
+  any of them. All prices and times remain 100% live from SerpApi; the table is
+  only a name->code lookup. To search a place not in the table, type its IATA
+  airport code directly.
+
+-------------------------------------------------------------------------------
+ HOW TRIP TYPES MAP TO SERPAPI
+-------------------------------------------------------------------------------
+  Google Flights round-trip and multi-city use a token-paginated, multi-call
+  flow. To keep API usage bounded and return full detail for every leg, this
+  app models each leg as an independent ONE-WAY search (SerpApi type=2) and
+  combines them:
+
+    one-way    1 leg.
+    round trip 2 legs: A->B over the outbound interval, B->A over the return
+               interval. Combined into outbound+return itineraries.
+    multi-city N legs, each its own one-way search, combined in order.
+
+  TRADE-OFF: a round-trip/multi-city total is the SUM of one-way fares. Real
+  airline round-trip fares are sometimes cheaper. This is surfaced in
+  meta.notes on every multi-leg response.
 
 -------------------------------------------------------------------------------
  USING THE PAGE (/search)
@@ -86,29 +125,31 @@ What it does:
   1. Pick a trip type: One way / Round trip / Multi-city.
   2. Type a place in From / To. Autocomplete suggests airports, whole cities
      ("Stockholm — all airports") and whole countries ("Greece"). Pick one, or
-     just type free text (e.g. a country name) and the server resolves it.
+     type free text (e.g. a country name) and the server resolves it.
   3. Dates:
        - Depart (from) is required.
-       - Depart (to) is OPTIONAL — leave it empty for a single day, or set it to
-         search a whole interval and let the provider find the cheapest day.
+       - Depart (to) is OPTIONAL — leave empty for a single day, or set it to
+         search an interval (capped; see QUOTA GUARDS).
        - Round trip adds Return (from)/(to) ranges.
        - Multi-city: "+ Add another flight" gives each leg its own date range.
   4. Choose travellers, cabin, max stops, and sort (Best/Cheapest/Fastest).
   5. Search. Results show Best/Cheapest/Fastest top picks plus a full list;
-     "Flight details" expands segments and layovers; "Select" opens the
-     provider's booking deep link.
+     "Flight details" expands segments and layovers; "View on Google Flights"
+     opens the trip on Google Flights to complete booking.
 
 -------------------------------------------------------------------------------
  HTTP API
 -------------------------------------------------------------------------------
-  GET /                      Service info + whether an API key is configured.
+  GET /                      Service info + whether a key is configured.
 
-  GET /api/health            { status, provider, host, apiKeyConfigured, ... }
+  GET /api/health            { status, provider, host, apiKeyConfigured,
+                               keySource (env|auth.json|none), caps, endpoints }
 
-  GET /api/locations?q=...   Autocomplete. Optional: types (default
-                             "airport,city,country"), limit (default 10).
-                             -> { locations: [ { value, type, label, sub, ... } ] }
-                             `value` is the code to send back as from/to.
+  GET /api/locations?q=...   Autocomplete from the embedded table (no API call,
+                             no key needed). Optional: types, limit (default 10).
+                             -> { locations: [ { value, type, label, sub } ] }
+                             `value` is the airport-code string to send as from/to
+                             (a country/city resolves to comma-separated codes).
 
   POST /api/search           Search flights. JSON body:
                              {
@@ -126,9 +167,9 @@ What it does:
                                  "dateTo":   "YYYY-MM-DD"   (optional; = single day),
                                  "returnFrom": "YYYY-MM-DD" (round trip only),
                                  "returnTo":   "YYYY-MM-DD" (round trip only) }
-                             from/to accept an airport IATA code (ARN), a city
-                             code (STO), a country code (SE/GR), or free text
-                             (e.g. "Greece") which the server resolves.
+                             from/to accept an airport IATA code (ARN), several
+                             comma-separated codes (ARN,BMA), a city or country
+                             name (resolved to codes), or a Google id (/m/...).
 
   The demo "items" CRUD from the base template is still present
   (GET/POST/PUT/DELETE /items, GET /items/:id) but is unrelated to flights.
@@ -143,7 +184,7 @@ What it does:
       "itineraries": [ <itinerary>, ... ],        // sorted by `sort`, max 50
       "topPicks": { "best": <itinerary>, "cheapest": <itinerary>, "fastest": <itinerary> }
     },
-    "meta":    { provider, currency, generatedAt }
+    "meta":    { provider:"serpapi", currency, generatedAt, notes:[...] }
   }
 
   Every itinerary uses one uniform "slice" model so the UI renders one-way,
@@ -151,8 +192,8 @@ What it does:
   multi-city leg, or the outbound/return half of a round trip):
 
   <itinerary> = {
-    id, price, pricePerPax, currency, bookingUrl, seats,
-    totalDurationMin, totalStops, score,           // score = best-ranking cost
+    id, price, pricePerPax, currency, bookingUrl,   // bookingUrl -> Google Flights
+    totalDurationMin, totalStops, score,            // score = best-ranking cost
     slices: [ {
       from, to, fromCity, toCity, date, stops, durationMin,
       segments: [ { from, to, fromCity, toCity, carrier, flightNo,
@@ -160,39 +201,46 @@ What it does:
     }, ... ]
   }
 
+  Pricing: SerpApi `price` mirrors the total Google Flights price for the
+  requested passengers; pricePerPax = price / passenger count.
+
 -------------------------------------------------------------------------------
  HOW core.js IS ORGANIZED
 -------------------------------------------------------------------------------
   1. ENDPOINTS  The route table ("METHOD /path" -> handler + params).
   2. PARAMS     Declares each input (source/type/required/default). Body params
                 trips/passengers use type "any" so nested JSON passes through.
-  3. FUNCTIONS  The handlers, the flight provider + engine, and the runtime.
+  3. FUNCTIONS  The handlers, the SerpApi provider + engine, and the runtime.
 
   Flight engine highlights (all in core.js):
-    - apiRequest()      Promise-based HTTPS to the provider; clean error mapping
-                        (503 no key, 502 upstream, 504 timeout).
-    - resolveCode()     Turns "Greece"/"Stockholm"/"ARN" into a provider code
-                        (cached). Canonical codes are passed straight through.
-    - providerSearch()  -> /v2/search       (one-way & round trip, date ranges)
-    - providerMulti()   -> /v2/flights_multi (multi-city, per-leg date ranges)
-    - buildSlices()     Splits a flat provider route into slices: round trips by
-                        the `return` flag; multi-city by matching each leg's
-                        destination code.
+    - serpKey()/loadAuth()  Resolve the key from env or auth.json.
+    - searchLocations()     Autocomplete over the embedded table.
+    - resolveToCodes()      "Greece"/"Stockholm"/"ARN" -> airport code string.
+    - serpOneWay()          One Google Flights one-way call (engine=google_flights,
+                            type=2); soft-fails to null on "no results".
+    - searchLeg()           Fans a leg out over its date interval (bounded),
+                            dedupes, ranks.
+    - combineLegs()/mergeItins()  Build bounded round-trip / multi-city combos.
     - sortItins()/topPicks()  Best = generalized cost (money + time*rate +
-                        stops*penalty); Cheapest = price; Fastest = duration.
+                            stops*penalty); Cheapest = price; Fastest = duration.
 
   Tunables near the top of the engine section:
-    TIME_VALUE_PER_HOUR, STOP_PENALTY  (how "Best" trades time/stops vs price).
+    TIME_VALUE_PER_HOUR, STOP_PENALTY     (how "Best" trades time/stops vs price)
+    MAX_RANGE_DAYS, MAX_TOTAL_CALLS, CONCURRENCY  (from the SERPAPI_* env vars)
 
 -------------------------------------------------------------------------------
  NOTES & LIMITATIONS
 -------------------------------------------------------------------------------
   - Zero npm dependencies; runs on a stock Node.js (>=18) install.
-  - Dates are sent to the provider as DD/MM/YYYY (converted automatically).
-  - Prices are TOTAL for the requested passengers; pricePerPax is derived.
-  - Provider date ranges can be wide; very large ranges may be slow upstream.
-  - search.html is read fresh on each /search request, so edits show up without
-    a restart.
-  - core.js can be `require`d without starting the server (it only listens when
-    run directly), which makes its handlers unit-testable.
+  - Date intervals cost one SerpApi call per day per leg — keep ranges modest
+    and tune the SERPAPI_* caps to your plan.
+  - Round-trip/multi-city totals are sums of one-way fares (see TRADE-OFF).
+  - Booking is a hand-off: "View on Google Flights" opens the prefilled trip.
+    (A direct per-itinerary booking URL would need SerpApi's separate Booking
+    Options call per result, which would multiply API usage.)
+  - The embedded airport table is a curated subset (~135 major airports). Add
+    rows to AIRPORT_ROWS in core.js to cover more places, or type IATA codes.
+  - search.html is read fresh on each /search request (edits need no restart).
+  - core.js can be `require`d without starting the server, which makes its
+    handlers unit-testable.
 ===============================================================================

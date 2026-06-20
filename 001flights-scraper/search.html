@@ -276,7 +276,7 @@
     </div>
 
     <div class="banner warn" id="keyBanner">
-      No flight API key configured on the server. Set <code>TEQUILA_API_KEY</code> (or <code>FLIGHT_API_KEY</code>) and restart to enable live search.
+      No SerpApi key found on the server. Add it to <code>auth.json</code> (<code>{ "serpapi": { "api_key": "…" } }</code>) or set <code>SERPAPI_API_KEY</code>, then restart to enable live search.
     </div>
     <div class="banner err" id="errBanner"></div>
   </section>
@@ -284,7 +284,7 @@
   <section id="results"></section>
 
   <footer>
-    Live results via the Kiwi.com Tequila API. Prices &amp; availability are provided by the airline/agency at time of search.
+    Live results via Google Flights (SerpApi). Prices are provided by the airline/agency at time of search; “View on Google Flights” opens the trip to complete booking.
   </footer>
 </div>
 
@@ -655,8 +655,8 @@
     var slicesHTML = it.slices.map(function (sl, i) { return sliceHTML(sl, it.slices.length > 1 ? labels[i] || ("Leg " + (i + 1)) : null); }).join("");
     var carriers = uniqueCarriers(it.slices).join(", ");
     var book = it.bookingUrl
-      ? '<a class="select" href="' + esc(it.bookingUrl) + '" target="_blank" rel="noopener">Select</a>'
-      : '<span class="select disabled">Select</span>';
+      ? '<a class="select" href="' + esc(it.bookingUrl) + '" target="_blank" rel="noopener">View on Google Flights ↗</a>'
+      : '<span class="select disabled">Unavailable</span>';
     return (
       '<div class="itin" data-i="' + idx + '">' +
         '<div class="head">' +
@@ -703,6 +703,9 @@
       '<span class="muted">' + esc(routeLabel) + '</span>' +
       '<span class="muted">' + esc(q.cabin || "economy") + ' · ' + esc(cap(q.tripType || "")) + '</span>' +
     '</div>';
+
+    var notes = (data.meta && data.meta.notes) || [];
+    if (notes.length) html += '<div class="banner warn show" style="margin:0 0 14px">' + notes.map(esc).join("<br>") + '</div>';
 
     var picksHTML = pickHTML("best", picks.best, cur) + pickHTML("cheapest", picks.cheapest, cur) + pickHTML("fastest", picks.fastest, cur);
     if (picksHTML) html += '<div class="picks">' + picksHTML + '</div>';
