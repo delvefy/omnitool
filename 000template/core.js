@@ -1,5 +1,5 @@
 /*
- * core.js — minimal Node.js HTTP app template (no external dependencies).
+ * core.js — minimal Node.js HTTP app 000template (no external dependencies).
  *
  * The file is organized into three sections:
  *   1. ENDPOINTS  — the route table (what URL maps to what function).
@@ -97,7 +97,7 @@ function home() {
   return {
     status: 200,
     body: {
-      name: 'core.js template API',
+      name: 'core.js 000template API',
       endpoints: Object.keys(endpoints),
     },
   };
