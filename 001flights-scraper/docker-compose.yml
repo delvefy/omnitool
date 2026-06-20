@@ -1,0 +1,17 @@
+services:
+  app:
+    build: .
+    image: core-template
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      # Live flight search via the Kiwi.com Tequila API. Put the key in your
+      # shell env (or a .env file next to this compose file) as TEQUILA_API_KEY.
+      - TEQUILA_API_KEY=${TEQUILA_API_KEY:-}
+      # Optional host override (defaults to api.tequila.kiwi.com).
+      - TEQUILA_HOST=${TEQUILA_HOST:-}
+    restart: unless-stopped
+    # Storage is ephemeral by design. For real persistence, the cleaner path is to make
+    # the DB location configurable in core.js (e.g. DB_PATH env) and mount a volume there,
+    # rather than mounting over the whole /app directory.

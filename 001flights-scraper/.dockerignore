@@ -1,0 +1,12 @@
+.git
+.gitignore
+auth.json
+node_modules
+npm-debug.log*
+.idea
+Dockerfile
+.dockerignore
+docker-compose.yml
+about.txt
+main.js
+*.md

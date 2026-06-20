@@ -1,0 +1,198 @@
+===============================================================================
+ Flight Finder — a Google-Flights-style search service
+===============================================================================
+
+Built on the zero-dependency Node.js HTTP template (core.js). It serves an
+interactive search page at /search and a small JSON API. Flight data is fetched
+LIVE from the Kiwi.com Tequila API.
+
+What it does:
+  - search city -> city, city -> country, country -> city, country -> country
+  - search a single day OR a date interval (earliest/latest departure)
+  - round trips with outbound AND return date intervals
+  - multi-city itineraries (e.g. Stockholm-Athens-Bucharest-Stockholm),
+    each leg with its own date interval
+  - ranks results as Best (price + travel time + stops), Cheapest, or Fastest
+
+-------------------------------------------------------------------------------
+ FILES
+-------------------------------------------------------------------------------
+  core.js       The whole backend: routes, the flight provider + engine, the
+                HTTP runtime. Same 3-section layout as the base template.
+  search.html   The entire web UI (HTML + CSS + JS, all inline, no build step).
+  db.json       The template's tiny demo "items" store (unrelated to flights).
+                Flight results are live and are NOT persisted.
+  docs.txt      This file.
+
+-------------------------------------------------------------------------------
+ SETUP — API KEY (required for live search)
+-------------------------------------------------------------------------------
+  Live search needs a Kiwi.com Tequila API key. Get one at
+  https://tequila.kiwi.com and provide it via environment variable:
+
+      TEQUILA_API_KEY=your_key_here        (alias also accepted: FLIGHT_API_KEY)
+
+  Optional:
+      TEQUILA_HOST=api.tequila.kiwi.com    (override the provider host)
+      PORT=3000                            (HTTP port, default 3000)
+
+  The server still BOOTS without a key — but every search returns HTTP 503 and
+  the /search page shows a "configure key" banner until a key is set.
+
+-------------------------------------------------------------------------------
+ SECRETS — auth.json (NOT committed)
+-------------------------------------------------------------------------------
+  Provider credentials live in auth.json at the project root. This file is
+  git-ignored (see .gitignore) and excluded from the Docker image (see
+  .dockerignore), so it must NEVER be committed. Create it manually per machine.
+
+  Current shape:
+
+      {
+        "serpapi": {
+          "provider": "serpapi.com",
+          "api_key": "<your-serpapi-key>",
+          "note": "..."
+        }
+      }
+
+  - serpapi.api_key  A SerpApi (https://serpapi.com) key. Reserved for a FUTURE
+    implementation that sources Google Flights data via SerpApi
+    (engine=google_flights) as an alternative/complement to the Tequila
+    provider. core.js does NOT read auth.json yet — the live Tequila provider
+    is still driven by the TEQUILA_API_KEY / FLIGHT_API_KEY env vars above.
+
+  When wiring SerpApi later: load auth.json at startup (fall back to a
+  SERPAPI_API_KEY env var), and add a provider adapter alongside
+  providerSearch()/providerMulti() in core.js.
+
+-------------------------------------------------------------------------------
+ RUNNING
+-------------------------------------------------------------------------------
+  Locally:
+      TEQUILA_API_KEY=xxxx node core.js
+      # then open http://localhost:3000/search
+
+  Docker:
+      docker build -t flight-finder .
+      docker run -p 3000:3000 -e TEQUILA_API_KEY=xxxx flight-finder
+
+  docker compose (reads TEQUILA_API_KEY from your shell env or a .env file):
+      TEQUILA_API_KEY=xxxx docker compose up
+
+-------------------------------------------------------------------------------
+ USING THE PAGE (/search)
+-------------------------------------------------------------------------------
+  1. Pick a trip type: One way / Round trip / Multi-city.
+  2. Type a place in From / To. Autocomplete suggests airports, whole cities
+     ("Stockholm — all airports") and whole countries ("Greece"). Pick one, or
+     just type free text (e.g. a country name) and the server resolves it.
+  3. Dates:
+       - Depart (from) is required.
+       - Depart (to) is OPTIONAL — leave it empty for a single day, or set it to
+         search a whole interval and let the provider find the cheapest day.
+       - Round trip adds Return (from)/(to) ranges.
+       - Multi-city: "+ Add another flight" gives each leg its own date range.
+  4. Choose travellers, cabin, max stops, and sort (Best/Cheapest/Fastest).
+  5. Search. Results show Best/Cheapest/Fastest top picks plus a full list;
+     "Flight details" expands segments and layovers; "Select" opens the
+     provider's booking deep link.
+
+-------------------------------------------------------------------------------
+ HTTP API
+-------------------------------------------------------------------------------
+  GET /                      Service info + whether an API key is configured.
+
+  GET /api/health            { status, provider, host, apiKeyConfigured, ... }
+
+  GET /api/locations?q=...   Autocomplete. Optional: types (default
+                             "airport,city,country"), limit (default 10).
+                             -> { locations: [ { value, type, label, sub, ... } ] }
+                             `value` is the code to send back as from/to.
+
+  POST /api/search           Search flights. JSON body:
+                             {
+                               "tripType": "oneway" | "round" | "multicity",
+                               "trips": [ <leg>, ... ],
+                               "passengers": { "adults": 1, "children": 0, "infants": 0 },
+                               "cabin": "economy" | "premium" | "business" | "first",
+                               "sort":  "best" | "cheapest" | "fastest",
+                               "maxStops": "any" | 0 | 1 | 2,
+                               "currency": "EUR"
+                             }
+                             A <leg> is:
+                               { "from": "...", "to": "...",
+                                 "dateFrom": "YYYY-MM-DD",
+                                 "dateTo":   "YYYY-MM-DD"   (optional; = single day),
+                                 "returnFrom": "YYYY-MM-DD" (round trip only),
+                                 "returnTo":   "YYYY-MM-DD" (round trip only) }
+                             from/to accept an airport IATA code (ARN), a city
+                             code (STO), a country code (SE/GR), or free text
+                             (e.g. "Greece") which the server resolves.
+
+  The demo "items" CRUD from the base template is still present
+  (GET/POST/PUT/DELETE /items, GET /items/:id) but is unrelated to flights.
+
+-------------------------------------------------------------------------------
+ RESPONSE SHAPE (POST /api/search)
+-------------------------------------------------------------------------------
+  {
+    "query":   { tripType, cabin, sort, currency, passengers, legs:[...] },
+    "results": {
+      "count": <int>,
+      "itineraries": [ <itinerary>, ... ],        // sorted by `sort`, max 50
+      "topPicks": { "best": <itinerary>, "cheapest": <itinerary>, "fastest": <itinerary> }
+    },
+    "meta":    { provider, currency, generatedAt }
+  }
+
+  Every itinerary uses one uniform "slice" model so the UI renders one-way,
+  round-trip and multi-city the same way. A slice = one directed journey (a
+  multi-city leg, or the outbound/return half of a round trip):
+
+  <itinerary> = {
+    id, price, pricePerPax, currency, bookingUrl, seats,
+    totalDurationMin, totalStops, score,           // score = best-ranking cost
+    slices: [ {
+      from, to, fromCity, toCity, date, stops, durationMin,
+      segments: [ { from, to, fromCity, toCity, carrier, flightNo,
+                    depart, arrive, durationMin }, ... ]
+    }, ... ]
+  }
+
+-------------------------------------------------------------------------------
+ HOW core.js IS ORGANIZED
+-------------------------------------------------------------------------------
+  1. ENDPOINTS  The route table ("METHOD /path" -> handler + params).
+  2. PARAMS     Declares each input (source/type/required/default). Body params
+                trips/passengers use type "any" so nested JSON passes through.
+  3. FUNCTIONS  The handlers, the flight provider + engine, and the runtime.
+
+  Flight engine highlights (all in core.js):
+    - apiRequest()      Promise-based HTTPS to the provider; clean error mapping
+                        (503 no key, 502 upstream, 504 timeout).
+    - resolveCode()     Turns "Greece"/"Stockholm"/"ARN" into a provider code
+                        (cached). Canonical codes are passed straight through.
+    - providerSearch()  -> /v2/search       (one-way & round trip, date ranges)
+    - providerMulti()   -> /v2/flights_multi (multi-city, per-leg date ranges)
+    - buildSlices()     Splits a flat provider route into slices: round trips by
+                        the `return` flag; multi-city by matching each leg's
+                        destination code.
+    - sortItins()/topPicks()  Best = generalized cost (money + time*rate +
+                        stops*penalty); Cheapest = price; Fastest = duration.
+
+  Tunables near the top of the engine section:
+    TIME_VALUE_PER_HOUR, STOP_PENALTY  (how "Best" trades time/stops vs price).
+
+-------------------------------------------------------------------------------
+ NOTES & LIMITATIONS
+-------------------------------------------------------------------------------
+  - Zero npm dependencies; runs on a stock Node.js (>=18) install.
+  - Dates are sent to the provider as DD/MM/YYYY (converted automatically).
+  - Prices are TOTAL for the requested passengers; pricePerPax is derived.
+  - Provider date ranges can be wide; very large ranges may be slow upstream.
+  - search.html is read fresh on each /search request, so edits show up without
+    a restart.
+  - core.js can be `require`d without starting the server (it only listens when
+    run directly), which makes its handlers unit-testable.
+===============================================================================

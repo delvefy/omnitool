@@ -1,0 +1,8 @@
+# Secrets — never commit. See docs.txt for the expected shape.
+auth.json
+.env
+.env.local
+
+# Node
+node_modules/
+npm-debug.log*

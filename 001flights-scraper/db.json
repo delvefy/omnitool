@@ -1,0 +1,7 @@
+{
+  "items": [
+    { "id": "1", "name": "First item", "value": 100 },
+    { "id": "2", "name": "Second item", "value": 200 }
+  ],
+  "_meta": { "nextId": 3 }
+}
