@@ -1,19 +1,34 @@
 services:
   app:
     build: .
-    image: core-template
+    image: flight-finder
+    container_name: flight-finder
     ports:
-      - "3000:3000"
+      # host:container. Override the host port if 3000 is taken, e.g.
+      #   HOST_PORT=3001 docker compose up -d
+      - "${HOST_PORT:-3001}:3001"
     environment:
-      - PORT=3000
-      # Live flight search via SerpApi (Google Flights). auth.json is not copied
-      # into the image, so provide the key here. Put SERPAPI_API_KEY in your
-      # shell env or a .env file next to this compose file.
-      - SERPAPI_API_KEY=${SERPAPI_API_KEY:-}
-      # Optional quota guards (see docs.txt).
+      - PORT=3001
+      # Optional quota guards (see docs.txt). Defaults are quota-friendly.
       - SERPAPI_MAX_RANGE_DAYS=${SERPAPI_MAX_RANGE_DAYS:-3}
       - SERPAPI_MAX_CALLS=${SERPAPI_MAX_CALLS:-12}
+      # The SerpApi key normally comes from the auth.json mount below. To use an
+      # env var instead (and skip the mount), set SERPAPI_API_KEY in your shell
+      # or a .env file next to this compose file — it takes precedence.
+      - SERPAPI_API_KEY=c46a0a070f0d7578b352e1c69955ac03248d80fd21f1ed06b3e77767b6c0382c
+    volumes:
+      # Live flight search needs a SerpApi key. auth.json is NOT baked into the
+      # image (.dockerignore), so it's mounted read-only at run time. This file
+      # must exist on the host — it's the one you created with your key:
+      #   { "serpapi": { "api_key": "..." } }
+      # Don't have an auth.json? Delete this line and set SERPAPI_API_KEY above.
+      - ./auth.json:/app/auth.json:ro
     restart: unless-stopped
-    # Storage is ephemeral by design. For real persistence, the cleaner path is to make
-    # the DB location configurable in core.js (e.g. DB_PATH env) and mount a volume there,
-    # rather than mounting over the whole /app directory.
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    # Note: db.json (the template demo store) is baked into the image and writes
+    # to it are ephemeral. The flight finder itself is stateless, so this is fine.

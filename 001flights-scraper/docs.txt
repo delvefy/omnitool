@@ -78,12 +78,20 @@ What it does:
   Locally (key in env):             SERPAPI_API_KEY=xxxx node core.js
                                     # then open http://localhost:3000/search
 
-  Docker:
+  Docker (key via auth.json — mounted read-only, never baked into the image):
       docker build -t flight-finder .
+      docker run -p 3000:3000 -v "$PWD/auth.json:/app/auth.json:ro" flight-finder
+
+  Docker (key via env var instead):
       docker run -p 3000:3000 -e SERPAPI_API_KEY=xxxx flight-finder
 
-  docker compose (reads SERPAPI_API_KEY from your shell env or a .env file):
-      SERPAPI_API_KEY=xxxx docker compose up
+  docker compose (mounts ./auth.json automatically — just works if it exists):
+      docker compose up --build
+    # Or skip auth.json and use an env var / .env file (SERPAPI_API_KEY takes
+    # precedence over the mounted file):
+      SERPAPI_API_KEY=xxxx docker compose up --build
+
+  Health: GET /api/health (also the container HEALTHCHECK). Open /search.
 
 -------------------------------------------------------------------------------
  HOW LOCATIONS WORK
