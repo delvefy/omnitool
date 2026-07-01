@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en" data-mode="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>Ephemeral Chat</title>
+<script>
+  // Apply saved theme early to avoid a flash of the wrong colors.
+  (function () {
+    var mode = localStorage.getItem('chat-mode')
+      || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+    document.documentElement.dataset.mode = mode
+  })()
+</script>
+<style>
+  :root { --radius: 14px; }
+
+  /* ---- Clean monochrome light / dark themes ---- */
+  html[data-mode="dark"] {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --border: #2a2f3a;
+    --text: #e7e9ee;
+    --muted: #8b93a3;
+    --input-bg: #0e1016;
+    --btn-hover: #232735;
+    --btn-hover-border: #3a4150;
+    --grad: #1b2130;
+    --overlay-bg: rgba(5,7,12,.7);
+    --shadow: rgba(0,0,0,.45);
+    --accent: #e7e9ee;         /* near-white for buttons/bubbles */
+    --accent-hover: #ffffff;
+    --accent-text: #0f1115;    /* dark text on accent */
+  }
+  html[data-mode="light"] {
+    --bg: #eef1f6;
+    --panel: #ffffff;
+    --panel-2: #f4f6fa;
+    --border: #dde2ea;
+    --text: #1b1f27;
+    --muted: #647082;
+    --input-bg: #ffffff;
+    --btn-hover: #eceff4;
+    --btn-hover-border: #c3cbd6;
+    --grad: #e2e8f2;
+    --overlay-bg: rgba(20,28,40,.3);
+    --shadow: rgba(20,30,50,.15);
+    --accent: #1b1f27;         /* near-black for buttons/bubbles */
+    --accent-hover: #000000;
+    --accent-text: #ffffff;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: radial-gradient(1200px 600px at 20% -10%, var(--grad) 0%, var(--bg) 60%);
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .app {
+    width: 100%;
+    max-width: 760px;
+    height: calc(100dvh - 32px);
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: 0 24px 60px var(--shadow);
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  header .title { font-weight: 700; letter-spacing: .2px; white-space: nowrap; }
+  header .room {
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    padding: 3px 8px;
+    border-radius: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    max-width: 40vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  header .spacer { flex: 1; }
+  .peers {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--text);
+    box-shadow: 0 0 0 3px var(--btn-hover);
+  }
+  .dot.off { background: var(--muted); }
+
+  button {
+    font: inherit;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    border-radius: 9px;
+    cursor: pointer;
+    transition: background .15s, border-color .15s, transform .1s;
+  }
+  button:hover { background: var(--btn-hover); border-color: var(--btn-hover-border); }
+  button:active { transform: scale(.97); }
+  button.primary { background: var(--accent); border-color: transparent; color: var(--accent-text); font-weight: 600; }
+  button.primary:hover { background: var(--accent-hover); }
+  button.icon { padding: 8px 10px; line-height: 1; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .msg { max-width: 78%; display: flex; flex-direction: column; gap: 2px; }
+  .msg .who { font-size: 11px; color: var(--muted); padding: 0 4px; }
+  .msg .bubble {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    border-radius: 12px;
+    border-top-left-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .msg.mine { align-self: flex-end; align-items: flex-end; }
+  .msg.mine .bubble {
+    background: var(--accent);
+    border-color: transparent;
+    border-radius: 12px;
+    border-top-right-radius: 4px;
+    color: var(--accent-text);
+  }
+  .msg.system { align-self: center; max-width: 90%; }
+  .msg.system .bubble {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    font-size: 12px;
+    font-style: italic;
+    padding: 2px;
+  }
+
+  /* ---- File messages ---- */
+  .bubble.file { padding: 6px; }
+  .bubble.file img {
+    max-width: min(260px, 100%);
+    max-height: 260px;
+    border-radius: 8px;
+    display: block;
+  }
+  .bubble .filelink {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: inherit;
+    text-decoration: none;
+    font-weight: 600;
+    padding: 4px 6px;
+  }
+  .bubble .filelink:hover { text-decoration: underline; }
+  .bubble .filemeta { font-size: 11px; opacity: .7; margin: 2px 6px 4px; }
+
+  .composer {
+    display: flex;
+    gap: 8px;
+    padding: 12px;
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+    border-top: 1px solid var(--border);
+    background: var(--panel-2);
+    align-items: center;
+  }
+  .composer input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-size: 16px; /* prevents iOS zoom-on-focus */
+    color: var(--text);
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    outline: none;
+  }
+  .composer input[type="text"]:focus { border-color: var(--accent); }
+
+  /* ---- Join overlay ---- */
+  .overlay {
+    position: fixed; inset: 0;
+    background: var(--overlay-bg);
+    backdrop-filter: blur(6px);
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px;
+    z-index: 10;
+  }
+  .card {
+    width: min(420px, 100%);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px;
+    box-shadow: 0 24px 60px var(--shadow);
+  }
+  .card h1 { margin: 0 0 4px; font-size: 20px; }
+  .card p { margin: 0 0 18px; color: var(--muted); font-size: 13px; }
+  .field { display: block; margin-bottom: 14px; }
+  .field > span {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 5px;
+  }
+  .field .inputrow { display: flex; gap: 8px; }
+  .field input {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-size: 16px;
+    color: var(--text);
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    outline: none;
+  }
+  .field input:focus { border-color: var(--accent); }
+  .card .primary { width: 100%; margin-top: 4px; padding: 12px; font-size: 15px; }
+  .hint { margin-top: 12px; font-size: 12px; color: var(--muted); }
+  .hidden { display: none !important; }
+
+  /* ---- Mobile ---- */
+  @media (max-width: 640px) {
+    body { padding: 0; }
+    .app {
+      max-width: 100%;
+      height: 100dvh;
+      border: none;
+      border-radius: 0;
+      box-shadow: none;
+    }
+    header { padding: 10px 12px; gap: 8px; }
+    header .room { max-width: 90px; }
+    .messages { padding: 12px; }
+    .msg { max-width: 86%; }
+  }
+</style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <span class="title">💬 Chat</span>
+      <span class="room" id="roomLabel">room …</span>
+      <span class="spacer"></span>
+      <button class="icon" id="modeBtn" title="Toggle light/dark">🌙</button>
+      <div class="peers"><span class="dot off" id="statusDot"></span><span id="peerCount">connecting…</span></div>
+      <button id="shareBtn" title="Copy room link">Share</button>
+    </header>
+
+    <div class="messages" id="messages"></div>
+
+    <form class="composer" id="composer">
+      <input type="file" id="fileInput" class="hidden" multiple />
+      <button type="button" class="icon" id="attachBtn" title="Attach a file" disabled>📎</button>
+      <input type="text" id="input" placeholder="Type a message…" autocomplete="off" maxlength="2000" disabled />
+      <button class="primary" type="submit" disabled id="sendBtn">Send</button>
+    </form>
+  </div>
+
+  <div class="overlay" id="nameOverlay">
+    <div class="card">
+      <h1>Join a room</h1>
+      <p>Your name and room are pre-filled at random — edit either one, then enter.</p>
+      <form id="nameForm">
+        <label class="field">
+          <span>Your name</span>
+          <div class="inputrow">
+            <input id="nameInput" autocomplete="off" maxlength="32" />
+            <button type="button" class="icon" id="rerollName" title="Random name">🎲</button>
+          </div>
+        </label>
+        <label class="field">
+          <span>Room</span>
+          <div class="inputrow">
+            <input id="roomInput" autocomplete="off" maxlength="48" />
+            <button type="button" class="icon" id="rerollRoom" title="Random room">🎲</button>
+          </div>
+        </label>
+        <button class="primary" type="submit">Enter room</button>
+      </form>
+      <div class="hint" id="roomHint">Share the room link after joining to invite others.</div>
+    </div>
+  </div>
+
+<script type="module">
+import { joinRoom } from 'https://esm.sh/trystero@0.21.4/nostr'
+
+// --- App identity (shared by everyone on the same page/deploy) ---
+const APP_ID = 'stateless-chat-ephemeral-v1'
+const MAX_FILE = 15 * 1024 * 1024 // 15 MB cap per file
+
+// --- Random word pools ---
+const ADJECTIVES = ['Swift', 'Quiet', 'Cosmic', 'Amber', 'Velvet', 'Lucky', 'Hidden', 'Brave', 'Neon', 'Wild', 'Frost', 'Solar']
+const ANIMALS = ['Otter', 'Falcon', 'Fox', 'Heron', 'Lynx', 'Panda', 'Raven', 'Wolf', 'Koala', 'Tiger', 'Moth', 'Orca']
+const pick = arr => arr[Math.floor(Math.random() * arr.length)]
+
+function randomName() {
+  return `${pick(ADJECTIVES)}${pick(ANIMALS)}${Math.floor(Math.random() * 90 + 10)}`
+}
+function randomRoom() {
+  return `${pick(ADJECTIVES)}-${pick(ANIMALS)}-${Math.floor(Math.random() * 900 + 100)}`.toLowerCase()
+}
+function slugify(s) {
+  return s.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+}
+function humanSize(n) {
+  if (n < 1024) return n + ' B'
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
+  return (n / (1024 * 1024)).toFixed(1) + ' MB'
+}
+
+// --- DOM refs ---
+const $ = id => document.getElementById(id)
+const messagesEl = $('messages')
+const inputEl = $('input')
+const sendBtn = $('sendBtn')
+const composer = $('composer')
+const fileInput = $('fileInput')
+const attachBtn = $('attachBtn')
+const roomLabel = $('roomLabel')
+const peerCountEl = $('peerCount')
+const statusDot = $('statusDot')
+const shareBtn = $('shareBtn')
+const modeBtn = $('modeBtn')
+const nameOverlay = $('nameOverlay')
+const nameForm = $('nameForm')
+const nameInput = $('nameInput')
+const roomInput = $('roomInput')
+
+// --- Prefill the join form with random (but editable) values ---
+const hashRoom = slugify(location.hash.replace(/^#/, ''))
+nameInput.value = localStorage.getItem('chat-name') || randomName()
+roomInput.value = hashRoom || randomRoom()
+$('rerollName').addEventListener('click', () => { nameInput.value = randomName(); nameInput.focus() })
+$('rerollRoom').addEventListener('click', () => { roomInput.value = randomRoom(); roomInput.focus() })
+
+// --- Theme (dark / light only) ---
+const root = document.documentElement
+function applyTheme(mode) {
+  root.dataset.mode = mode
+  modeBtn.textContent = mode === 'dark' ? '🌙' : '☀️'
+  localStorage.setItem('chat-mode', mode)
+}
+applyTheme(root.dataset.mode || 'dark')
+modeBtn.addEventListener('click', () =>
+  applyTheme(root.dataset.mode === 'dark' ? 'light' : 'dark'))
+
+// --- State ---
+let myName = ''
+let roomId = ''
+const peerNames = new Map() // peerId -> name
+
+// --- Rendering ---
+function newMsgWrap({ mine, system }) {
+  const wrap = document.createElement('div')
+  wrap.className = 'msg' + (mine ? ' mine' : '') + (system ? ' system' : '')
+  return wrap
+}
+
+function addMessage({ text, name, mine = false, system = false }) {
+  const wrap = newMsgWrap({ mine, system })
+  if (!system) {
+    const who = document.createElement('div')
+    who.className = 'who'
+    who.textContent = mine ? 'You' : (name || 'Anonymous')
+    wrap.appendChild(who)
+  }
+  const bubble = document.createElement('div')
+  bubble.className = 'bubble'
+  bubble.textContent = text
+  wrap.appendChild(bubble)
+  messagesEl.appendChild(wrap)
+  messagesEl.scrollTop = messagesEl.scrollHeight
+}
+
+function addFileMessage({ blob, fileName, type, size, mine = false, senderName }) {
+  const url = URL.createObjectURL(blob)
+  const wrap = newMsgWrap({ mine })
+
+  const who = document.createElement('div')
+  who.className = 'who'
+  who.textContent = mine ? 'You' : (senderName || 'Anonymous')
+  wrap.appendChild(who)
+
+  const bubble = document.createElement('div')
+  bubble.className = 'bubble file'
+
+  if (type && type.startsWith('image/')) {
+    const link = document.createElement('a')
+    link.href = url
+    link.download = fileName
+    link.target = '_blank'
+    const img = document.createElement('img')
+    img.src = url
+    img.alt = fileName
+    img.loading = 'lazy'
+    link.appendChild(img)
+    bubble.appendChild(link)
+    const meta = document.createElement('div')
+    meta.className = 'filemeta'
+    meta.textContent = `${fileName} · ${humanSize(size)}`
+    bubble.appendChild(meta)
+  } else {
+    const link = document.createElement('a')
+    link.href = url
+    link.download = fileName
+    link.className = 'filelink'
+    link.appendChild(document.createTextNode('📄 ' + fileName))
+    bubble.appendChild(link)
+    const meta = document.createElement('div')
+    meta.className = 'filemeta'
+    meta.textContent = humanSize(size) + ' · click to download'
+    bubble.appendChild(meta)
+  }
+
+  wrap.appendChild(bubble)
+  messagesEl.appendChild(wrap)
+  messagesEl.scrollTop = messagesEl.scrollHeight
+}
+
+function updatePeerCount() {
+  const n = peerNames.size
+  statusDot.classList.remove('off')
+  peerCountEl.textContent = n === 0
+    ? 'just you'
+    : `${n} other${n === 1 ? '' : 's'} online`
+}
+
+// --- Networking (set up after the join form is submitted) ---
+let sendChat, sendName, sendFile
+
+function connect() {
+  const room = joinRoom({ appId: APP_ID }, roomId)
+
+  const [doSendChat, onChat] = room.makeAction('chat')
+  const [doSendName, onName] = room.makeAction('name')
+  const [doSendFile, onFile] = room.makeAction('file')
+  sendChat = doSendChat
+  sendName = doSendName
+  sendFile = doSendFile
+
+  onChat((text, peerId) => {
+    if (typeof text !== 'string') return
+    addMessage({ text, name: peerNames.get(peerId) || 'Anonymous' })
+  })
+
+  onName((name, peerId) => {
+    if (typeof name !== 'string') return
+    const known = peerNames.has(peerId)
+    peerNames.set(peerId, name)
+    updatePeerCount()
+    if (!known) addMessage({ system: true, text: `${name} joined` })
+  })
+
+  onFile((bytes, peerId, meta) => {
+    meta = meta || {}
+    const type = meta.type || 'application/octet-stream'
+    const blob = new Blob([bytes], { type })
+    addFileMessage({
+      blob,
+      fileName: meta.name || 'file',
+      type,
+      size: meta.size ?? blob.size,
+      senderName: peerNames.get(peerId) || 'Anonymous'
+    })
+  })
+
+  room.onPeerJoin(peerId => {
+    // Announce our name to the newcomer
+    sendName(myName, peerId)
+  })
+
+  room.onPeerLeave(peerId => {
+    const name = peerNames.get(peerId)
+    peerNames.delete(peerId)
+    updatePeerCount()
+    if (name) addMessage({ system: true, text: `${name} left` })
+  })
+
+  updatePeerCount()
+
+  // Enable composer
+  inputEl.disabled = false
+  sendBtn.disabled = false
+  attachBtn.disabled = false
+  inputEl.focus()
+}
+
+// --- Sending files ---
+async function shareFile(file) {
+  if (!sendFile) return
+  if (file.size > MAX_FILE) {
+    addMessage({ system: true, text: `"${file.name}" is too large (max ${humanSize(MAX_FILE)})` })
+    return
+  }
+  const bytes = new Uint8Array(await file.arrayBuffer())
+  const meta = { name: file.name, type: file.type, size: file.size }
+  sendFile(bytes, null, meta)
+  addFileMessage({
+    blob: new Blob([bytes], { type: file.type }),
+    fileName: file.name,
+    type: file.type,
+    size: file.size,
+    mine: true
+  })
+}
+
+// --- Handlers ---
+composer.addEventListener('submit', e => {
+  e.preventDefault()
+  const text = inputEl.value.trim()
+  if (!text || !sendChat) return
+  sendChat(text)
+  addMessage({ text, mine: true })
+  inputEl.value = ''
+})
+
+attachBtn.addEventListener('click', () => fileInput.click())
+fileInput.addEventListener('change', async () => {
+  for (const file of fileInput.files) await shareFile(file)
+  fileInput.value = ''
+})
+
+nameForm.addEventListener('submit', e => {
+  e.preventDefault()
+  myName = nameInput.value.trim() || randomName()
+  roomId = slugify(roomInput.value) || randomRoom()
+  localStorage.setItem('chat-name', myName)
+  history.replaceState(null, '', '#' + roomId)
+  roomLabel.textContent = 'room ' + roomId
+  roomLabel.title = roomId
+  nameOverlay.classList.add('hidden')
+  addMessage({ system: true, text: `You joined "${roomId}" as ${myName}` })
+  connect()
+})
+
+shareBtn.addEventListener('click', async () => {
+  const url = location.href
+  try {
+    await navigator.clipboard.writeText(url)
+    const prev = shareBtn.textContent
+    shareBtn.textContent = 'Copied!'
+    setTimeout(() => (shareBtn.textContent = prev), 1500)
+  } catch {
+    prompt('Copy this link:', url)
+  }
+})
+</script>
+</body>
+</html>
